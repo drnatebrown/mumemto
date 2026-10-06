@@ -129,6 +129,76 @@ if(NOT sdsl_POPULATED)
   target_compile_options(sdsl PRIVATE -w)
 endif()
 
+# grlBWT (https://github.com/BenLangmead/grlBWT). Reuse the SDSL target fetched
+# above instead of a system install. SAIL itself is not fetched yet (repo is
+# not public); mumemto_exec takes SAIL_INCLUDE. TODO: FetchContent sail the
+# same way once the repository is public.
+FetchContent_Declare(
+  grlbwt
+  GIT_REPOSITORY https://github.com/BenLangmead/grlBWT.git
+  GIT_TAG        parallel-merge
+)
+
+FetchContent_GetProperties(grlbwt)
+if(NOT grlbwt_POPULATED)
+  FetchContent_Populate(grlbwt)
+
+  # cdt reads these at configure time. Point them at fetched SDSL.
+  set(LIBSDSL_INCLUDE_DIRS "${sdsl_SOURCE_DIR}/include")
+  set(LIBSDSL_LIBRARIES "")
+
+  add_subdirectory(${grlbwt_SOURCE_DIR}/external/cdt ${grlbwt_BINARY_DIR}/cdt)
+  add_subdirectory(${grlbwt_SOURCE_DIR}/external/bioparsers ${grlbwt_BINARY_DIR}/bioparsers)
+  # xxHash + -march=native includes immintrin headers this GCC cannot compile.
+  target_compile_options(cdt PRIVATE
+    "$<$<COMPILE_LANGUAGE:C>:-mno-avx512f>"
+    "$<$<COMPILE_LANGUAGE:C>:-mno-avx2>"
+    "$<$<COMPILE_LANGUAGE:C>:-mno-avx>")
+  target_link_libraries(cdt PUBLIC sdsl)
+  target_include_directories(cdt SYSTEM PUBLIC "${sdsl_SOURCE_DIR}/include")
+
+  add_library(grlbwt_lib STATIC
+    ${grlbwt_SOURCE_DIR}/lib/exact_algo/exact_ind_phase.cpp
+    ${grlbwt_SOURCE_DIR}/lib/exact_algo/exact_par_phase.cpp
+    ${grlbwt_SOURCE_DIR}/lib/opt_algo/opt_ind_phase.cpp
+    ${grlbwt_SOURCE_DIR}/lib/opt_algo/opt_par_phase.cpp
+  )
+  target_link_libraries(grlbwt_lib PUBLIC sdsl z pthread cdt)
+  target_include_directories(grlbwt_lib PUBLIC
+    ${grlbwt_SOURCE_DIR}/include
+    ${grlbwt_SOURCE_DIR}/include/exact_algo
+    ${grlbwt_SOURCE_DIR}/include/opt_algo
+    ${grlbwt_SOURCE_DIR}/external
+    ${sdsl_SOURCE_DIR}/include
+  )
+  if(UNIX AND NOT APPLE)
+    target_link_libraries(grlbwt_lib PUBLIC stdc++fs)
+  endif()
+  if(NOT CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64")
+    target_compile_options(grlbwt_lib PUBLIC -msse4.2)
+  endif()
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(grlbwt_lib PUBLIC -march=native)
+  endif()
+
+  set_target_properties(grlbwt_lib cdt biopar PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+  )
+
+  add_executable(grlbwt-cli ${grlbwt_SOURCE_DIR}/main.cpp)
+  target_link_libraries(grlbwt-cli PRIVATE grlbwt_lib biopar)
+  target_include_directories(grlbwt-cli PRIVATE
+    ${grlbwt_SOURCE_DIR}/external/bioparsers/include
+    ${grlbwt_SOURCE_DIR}/include
+    ${grlbwt_SOURCE_DIR}/external
+  )
+  set_target_properties(grlbwt-cli PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+  )
+endif()
+
 ## Add divsuffsort
 # FetchContent_Declare(
 #   divsufsort

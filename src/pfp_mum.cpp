@@ -22,6 +22,7 @@
 #include <pfp_lcp_mum.hpp>
 #include <mem_finder.hpp>
 #include <direct_gsacak.hpp>
+#include <sail_lcp.hpp>
 // #include <mum_finder.hpp>
 #include <getopt.h>
 #include <queue>
@@ -54,7 +55,7 @@ int build_main(int argc, char** argv) {
     print_build_status_info(build_opts, ref_build, mum_mode);
 
     // Build the input reference file, and bitvector labeling the end for each doc
-    if (build_opts.use_gsacak || build_opts.from_parse_flag)
+    if (build_opts.use_gsacak || build_opts.use_sail || build_opts.from_parse_flag)
         STATUS_LOG("build_main", "parsing input files");
     else
         STATUS_LOG("build_main", "computing PFP over input files");
@@ -63,7 +64,7 @@ int build_main(int argc, char** argv) {
         build_opts.pfp_w,
         build_opts.hash_mod,
         true,
-        build_opts.use_gsacak,
+        build_opts.use_gsacak || build_opts.use_sail,
         build_opts.keep_temp || build_opts.only_parse
     );
     if (input_file_status == 1) {
@@ -90,6 +91,31 @@ int build_main(int argc, char** argv) {
 
         if (!build_opts.keep_temp)
             remove_temp_files(build_opts.output_prefix);
+        return 0;
+    }
+
+    if (build_opts.use_sail) {
+        sail_lcp sail(build_opts.output_prefix, &ref_build, build_opts.rlbwt_prefix,
+                      build_opts.threads, build_opts.keep_temp);
+
+        STATUS_LOG("sail", "computing iterator for LCP, BWT, SA");
+        start = std::chrono::system_clock::now();
+        sail.construct();
+        auto sec = std::chrono::duration<double>((std::chrono::system_clock::now() - start));
+        std::fprintf(stderr, " done.  (%.3f sec)\n", sec.count());
+
+        STATUS_LOG("build_main", "finding multi-%ss", mum_mode ? "MUM" : "MEM");
+        start = std::chrono::system_clock::now();
+        mem_finder match_finder(build_opts.output_prefix, ref_build, build_opts.min_match_len,
+                                build_opts.num_distinct_docs, build_opts.rare_freq,
+                                build_opts.max_mem_freq, build_opts.binary, build_opts.merge,
+                                build_opts.anchor_merge);
+        size_t count = sail.process(match_finder);
+        match_finder.close();
+        sec = std::chrono::duration<double>((std::chrono::system_clock::now() - start));
+        std::fprintf(stderr, " done.  (%.3f sec)\n", sec.count());
+
+        FORCE_LOG("build_main", "Found %d matches!", count);
         return 0;
     }
 
@@ -223,6 +249,13 @@ void print_build_status_info(BuildOptions& opts, RefBuilder& ref_build, bool mum
     std::string match_type = mum_mode ? "MUM" : "MEM";
     std::fprintf(stderr, "\tOutput path: %s\n", opts.output_prefix.data());
     if (opts.use_gsacak) {std::fprintf(stderr, "\tUsing gsacak to compute LCP, BWT, SA\n");}
+    else if (opts.use_sail) {
+        std::fprintf(stderr, "\tUsing SAIL to compute LCP, BWT, SA (threads=%d)\n",
+                     static_cast<int>(opts.threads));
+        if (!opts.rlbwt_prefix.empty()) {
+            std::fprintf(stderr, "\tRLBWT prefix: %s\n", opts.rlbwt_prefix.data());
+        }
+    }
     else if (!opts.from_parse_flag && !opts.arrays_in_flag)
         std::fprintf(stderr, "\tPFP window size: %d\n", opts.pfp_w);
     if (opts.arrays_out) {std::fprintf(stderr, "\tWriting LCP, BWT and suffix arrays\n");}
@@ -276,12 +309,15 @@ void parse_build_options(int argc, char** argv, BuildOptions* opts) {
         {"merge",   no_argument, NULL,  'M'},
         {"anchor",   no_argument, NULL,  'n'},
         {"use-gsacak",   no_argument, NULL,  'g'},
+        {"use-sail",     no_argument, NULL,  'S'},
+        {"threads",      required_argument, NULL,  't'},
+        {"rlbwt-prefix", required_argument, NULL,  'R'},
         {0, 0, 0,  0}
     };
     int c = 0;
     int long_index = 0;
     
-    while ((c = getopt_long(argc, argv, "hi:F:o:w:sl:ra:AKk:p:m:f:bgMnP", long_options, &long_index)) >= 0) {
+    while ((c = getopt_long(argc, argv, "hi:F:o:w:sl:ra:AKk:p:m:f:bgMnPSt:R:", long_options, &long_index)) >= 0) {
         switch(c) {
             case 'h': mumemto_usage(); std::exit(0);
             case 'i': opts->input_list.assign(optarg); break;
@@ -302,6 +338,9 @@ void parse_build_options(int argc, char** argv, BuildOptions* opts) {
             case 'M': opts->merge = true; break;
             case 'n': opts->anchor_merge = true; break;
             case 'g': opts->use_gsacak = true; break;
+            case 'S': opts->use_sail = true; break;
+            case 't': opts->threads = static_cast<size_t>(std::atoi(optarg)); break;
+            case 'R': opts->rlbwt_prefix.assign(optarg); opts->use_sail = true; break;
             case 'P': opts->only_parse = true; break;
             default: mumemto_usage(); std::exit(1);
         }
@@ -341,8 +380,11 @@ int mumemto_usage() {
     std::fprintf(stderr, "\t%-22s%-10swindow size used for pfp (default: 10)\n", "-w, --window", "[INT]");
     std::fprintf(stderr, "\t%-22s%-10shash-modulus used for pfp (default: 100)\n", "-m, --modulus", "[INT]");
     std::fprintf(stderr, "\t%-32suse pre-computed pf-parse (with shared PREFIX.parse and PREFIX.dict)\n", "-p, --from-parse", "[PREFIX]");
-    std::fprintf(stderr, "\t%-32skeep PFP files\n", "-K, --keep-temp-files");
+    std::fprintf(stderr, "\t%-32skeep PFP/SAIL files\n", "-K, --keep-temp-files");
     std::fprintf(stderr, "\t%-32sskip PFP and use gsacak directly to compute LCP, BWT, SA\n", "-g, --use-gsacak");
+    std::fprintf(stderr, "\t%-32sskip PFP and use SAIL to compute LCP, BWT, SA\n", "-S, --use-sail");
+    std::fprintf(stderr, "\t%-22s%-10sthreads (default: 1)\n", "-t, --threads", "[INT]");
+    std::fprintf(stderr, "\t%-22s%-10sload existing <PREFIX>.bwt.heads/.bwt.len instead of running grlBWT\n", "-R, --rlbwt-prefix", "[PREFIX]");
     std::fprintf(stderr, "\t%-32sonly compute PFP over the input files and do not compute matches\n\n", "-P, --only-parse");
 
     std::fprintf(stderr, "Overview:\n");

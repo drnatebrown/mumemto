@@ -76,6 +76,9 @@ struct BuildOptions {
         bool anchor_merge = false;
         bool use_gsacak = false;
         bool only_parse = false;
+        bool use_sail = false;
+        size_t threads = 1;
+        std::string rlbwt_prefix = "";
 
         bool validate() {
             /* checks the arguments and make sure they are valid 
@@ -101,9 +104,10 @@ struct BuildOptions {
             else if (!is_dir(p.parent_path().string()))
                 std::filesystem::create_directories(p.parent_path());
 
-            if ((only_parse && use_gsacak) || (only_parse && arrays_in_flag) || (only_parse && from_parse_flag)) {
+            if ((only_parse && use_gsacak) || (only_parse && use_sail) ||
+                (only_parse && arrays_in_flag) || (only_parse && from_parse_flag)) {
                 only_parse = false;
-                FORCE_LOG("build_main", "only-parse flag is not supported with use-gsacak, arrays-in, or from-parse, ignoring flag");
+                FORCE_LOG("build_main", "only-parse flag is not supported with use-gsacak, use-sail, arrays-in, or from-parse, ignoring flag");
             }
             if (use_gsacak && from_parse_flag) {
                 FATAL_ERROR("--use-gsacak flag is incompatible with --from-parse flag");
@@ -111,8 +115,27 @@ struct BuildOptions {
             if (use_gsacak && arrays_in_flag) {
                 FATAL_ERROR("--use-gsacak flag is incompatible with --arrays-in flag");
             }
+            if (use_gsacak && use_sail) {
+                FATAL_ERROR("--use-gsacak flag is incompatible with --use-sail flag");
+            }
+            if (use_sail && from_parse_flag) {
+                FATAL_ERROR("--use-sail flag is incompatible with --from-parse flag");
+            }
+            if (use_sail && arrays_in_flag) {
+                FATAL_ERROR("--use-sail flag is incompatible with --arrays-in flag");
+            }
             if (from_parse_flag && arrays_in_flag) {
                 FATAL_ERROR("--from-parse flag is incompatible with --arrays-in flag");
+            }
+            if (threads == 0) {
+                threads = 1;
+            }
+            if (!rlbwt_prefix.empty()) {
+                if (!is_file(rlbwt_prefix + ".bwt.heads") || !is_file(rlbwt_prefix + ".bwt.len")) {
+                    FATAL_ERROR(("Missing RLBWT sidecars for --rlbwt-prefix. Expected " +
+                                 rlbwt_prefix + ".bwt.heads and " + rlbwt_prefix + ".bwt.len").c_str());
+                }
+                use_sail = true;
             }
 
             if (anchor_merge && !merge) {

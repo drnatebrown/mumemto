@@ -6,9 +6,15 @@ function(set_arch_specific_flags target)
 endfunction()
 
 add_executable(mumemto_exec pfp_mum.cpp ref_builder.cpp)
-target_link_libraries(mumemto_exec common pfp gsacak64 sdsl z)
-target_include_directories(mumemto_exec PUBLIC "../include/")
+find_package(OpenMP REQUIRED)
+# SAIL is header-only and not public yet. Point SAIL_INCLUDE at a local checkout.
+# TODO: FetchContent sail the same way as grlbwt once the repository is public.
+set(SAIL_INCLUDE "/home/nbrown99/repos/sail/include" CACHE PATH "Path to SAIL headers")
+target_link_libraries(mumemto_exec common pfp gsacak64 sdsl z OpenMP::OpenMP_CXX)
+target_include_directories(mumemto_exec PUBLIC "../include/" "${SAIL_INCLUDE}")
 target_compile_options(mumemto_exec PUBLIC "-std=c++17" "-DM64" "-w")
+target_compile_definitions(mumemto_exec PRIVATE "MUMEMTO_GRLBWT_BIN=\"$<TARGET_FILE:grlbwt-cli>\"")
+add_dependencies(mumemto_exec grlbwt-cli)
 set_arch_specific_flags(mumemto_exec)
 
 # Add compute_lengths executable
