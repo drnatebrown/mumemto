@@ -39,14 +39,16 @@ int build_main(int argc, char** argv) {
     // print_build_status_info(&build_opts);
     bool mum_mode = build_opts.validate();
 
-    // Declare ref_build first
+    // Declare ref_build first. SAIL -R reuses PREFIX.lengths like PFP -p (no FASTA re-parse).
     RefBuilder ref_build =
         (build_opts.from_parse_flag || build_opts.arrays_in_flag)
             ? RefBuilder(build_opts.from_parse_flag ? build_opts.parse_prefix : build_opts.arrays_in,
                          build_opts.use_rcomp)
-            : (build_opts.input_list.length()
-                   ? RefBuilder(build_opts.input_list, build_opts.output_prefix, build_opts.use_rcomp)
-                   : RefBuilder(build_opts.files, build_opts.output_prefix, build_opts.use_rcomp));
+            : (build_opts.from_rlbwt_lengths
+                   ? RefBuilder(build_opts.rlbwt_prefix, build_opts.use_rcomp)
+                   : (build_opts.input_list.length()
+                          ? RefBuilder(build_opts.input_list, build_opts.output_prefix, build_opts.use_rcomp)
+                          : RefBuilder(build_opts.files, build_opts.output_prefix, build_opts.use_rcomp)));
 
     // normalize and reconcile the input parameters
     build_opts.set_parameters(ref_build.num_docs, mum_mode);
@@ -55,7 +57,9 @@ int build_main(int argc, char** argv) {
     print_build_status_info(build_opts, ref_build, mum_mode);
 
     // Build the input reference file, and bitvector labeling the end for each doc
-    if (build_opts.use_gsacak || build_opts.use_sail || build_opts.from_parse_flag)
+    if (build_opts.from_rlbwt_lengths)
+        STATUS_LOG("build_main", "loading sequence lengths");
+    else if (build_opts.use_gsacak || build_opts.use_sail || build_opts.from_parse_flag)
         STATUS_LOG("build_main", "parsing input files");
     else
         STATUS_LOG("build_main", "computing PFP over input files");
@@ -70,6 +74,19 @@ int build_main(int argc, char** argv) {
     if (input_file_status == 1) {
         remove_temp_files(build_opts.output_prefix);
         FATAL_ERROR("Please check the input files and ensure that it contains valid FASTA files. Cleaning up...");
+    }
+    // Mirror lengths under -o so downstream tools (extract, coverage) find PREFIX.lengths
+    if (build_opts.from_rlbwt_lengths &&
+        build_opts.rlbwt_prefix != build_opts.output_prefix) {
+        std::error_code ec;
+        std::filesystem::copy_file(
+            build_opts.rlbwt_prefix + ".lengths",
+            build_opts.output_prefix + ".lengths",
+            std::filesystem::copy_options::overwrite_existing,
+            ec);
+        if (ec) {
+            FATAL_ERROR(("Failed to copy lengths to output prefix: " + ec.message()).c_str());
+        }
     }
     DONE_LOG((std::chrono::system_clock::now() - start));
 
@@ -224,6 +241,10 @@ void print_build_status_info(BuildOptions& opts, RefBuilder& ref_build, bool mum
     std::fprintf(stderr, "\nOverview of Parameters:\n");
     if (opts.from_parse_flag) {
         std::fprintf(stderr, "\tUsing pre-computed PFP files with prefix: %s\n", opts.parse_prefix.data());
+    }
+    else if (opts.from_rlbwt_lengths) {
+        std::fprintf(stderr, "\tUsing sequence lengths from RLBWT prefix (N = %d): %s\n",
+                     ref_build.num_docs, opts.rlbwt_prefix.data());
     }
     else if (opts.arrays_in.length() > 0)
         std::fprintf(stderr, "\tUsing pre-computed LCP/BWT/SA arrays from files with prefix: %s\n", opts.arrays_in.data());
@@ -384,7 +405,7 @@ int mumemto_usage() {
     std::fprintf(stderr, "\t%-32sskip PFP and use gsacak directly to compute LCP, BWT, SA\n", "-g, --use-gsacak");
     std::fprintf(stderr, "\t%-32sskip PFP and use SAIL to compute LCP, BWT, SA\n", "-S, --use-sail");
     std::fprintf(stderr, "\t%-22s%-10sthreads (default: 1)\n", "-t, --threads", "[INT]");
-    std::fprintf(stderr, "\t%-22s%-10sload existing <PREFIX>.bwt.heads/.bwt.len instead of running grlBWT\n", "-R, --rlbwt-prefix", "[PREFIX]");
+    std::fprintf(stderr, "\t%-22s%-10sload existing <PREFIX>.bwt.heads/.bwt.len/.lengths instead of\n\t%-32srunning grlBWT / re-parsing FASTAs\n", "-R, --rlbwt-prefix", "[PREFIX]", "");
     std::fprintf(stderr, "\t%-32sonly compute PFP over the input files and do not compute matches\n\n", "-P, --only-parse");
 
     std::fprintf(stderr, "Overview:\n");

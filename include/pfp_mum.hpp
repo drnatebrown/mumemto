@@ -79,18 +79,40 @@ struct BuildOptions {
         bool use_sail = false;
         size_t threads = 1;
         std::string rlbwt_prefix = "";
+        // When -R is set, also reuse PREFIX.lengths (skip FASTA re-parse), like PFP -p.
+        bool from_rlbwt_lengths = false;
 
         bool validate() {
             /* checks the arguments and make sure they are valid 
                returns MUM vs MEM designation based on input arguments*/
+            if (!rlbwt_prefix.empty()) {
+                if (!is_file(rlbwt_prefix + ".bwt.heads") || !is_file(rlbwt_prefix + ".bwt.len")) {
+                    FATAL_ERROR(("Missing RLBWT sidecars for --rlbwt-prefix. Expected " +
+                                 rlbwt_prefix + ".bwt.heads and " + rlbwt_prefix + ".bwt.len").c_str());
+                }
+                if (!is_file(rlbwt_prefix + ".lengths")) {
+                    FATAL_ERROR(("Missing *.lengths for --rlbwt-prefix. Expected file: " +
+                                 rlbwt_prefix + ".lengths").c_str());
+                }
+                use_sail = true;
+                from_rlbwt_lengths = true;
+            }
+
             if (input_list.length() && !is_file(input_list)) // provided a file-list
                 FATAL_ERROR("The provided file-list is not valid.");
             else if (input_list.length() && is_file(input_list) && (files.size() > 0)) {
                 FORCE_LOG("build_main", "Using filelist, ignoring positional args");
                 files.clear();
             }
-            else if (input_list.length() == 0 && (files.size() == 0) && (!from_parse_flag && !arrays_in_flag))
+            else if (input_list.length() == 0 && (files.size() == 0) &&
+                     (!from_parse_flag && !arrays_in_flag && !from_rlbwt_lengths))
                 FATAL_ERROR("Need to provide a file-list or files as positional args for processing.");
+
+            if (from_rlbwt_lengths && (input_list.length() || files.size() > 0)) {
+                FORCE_LOG("build_main", "Reusing lengths from --rlbwt-prefix, ignoring FASTA inputs");
+                input_list.clear();
+                files.clear();
+            }
             
             for (auto f : files) {
                 if (!is_file(f)) {
@@ -129,13 +151,6 @@ struct BuildOptions {
             }
             if (threads == 0) {
                 threads = 1;
-            }
-            if (!rlbwt_prefix.empty()) {
-                if (!is_file(rlbwt_prefix + ".bwt.heads") || !is_file(rlbwt_prefix + ".bwt.len")) {
-                    FATAL_ERROR(("Missing RLBWT sidecars for --rlbwt-prefix. Expected " +
-                                 rlbwt_prefix + ".bwt.heads and " + rlbwt_prefix + ".bwt.len").c_str());
-                }
-                use_sail = true;
             }
 
             if (anchor_merge && !merge) {
