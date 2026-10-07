@@ -56,37 +56,41 @@ int build_main(int argc, char** argv) {
     // print parameters and begin pipeline
     print_build_status_info(build_opts, ref_build, mum_mode);
 
-    // Build the input reference file, and bitvector labeling the end for each doc
-    if (build_opts.from_rlbwt_lengths)
-        STATUS_LOG("build_main", "loading sequence lengths");
-    else if (build_opts.use_gsacak || build_opts.use_sail || build_opts.from_parse_flag)
-        STATUS_LOG("build_main", "parsing input files");
-    else
-        STATUS_LOG("build_main", "computing PFP over input files");
+    // Build the input reference file. SAIL streams to .grl_text (or reuses -R lengths)
+    // and does not build the doc_ends bitvector; PFP/gsacak still do.
     auto start = std::chrono::system_clock::now();
-    int input_file_status = ref_build.build_input_file(
-        build_opts.pfp_w,
-        build_opts.hash_mod,
-        true,
-        build_opts.use_gsacak || build_opts.use_sail,
-        build_opts.keep_temp || build_opts.only_parse
-    );
+    int input_file_status = 0;
+    if (build_opts.use_sail && build_opts.from_rlbwt_lengths) {
+        STATUS_LOG("build_main", "loading sequence lengths");
+        ref_build.set_total_length();
+        if (build_opts.rlbwt_prefix != build_opts.output_prefix) {
+            std::error_code ec;
+            std::filesystem::copy_file(
+                build_opts.rlbwt_prefix + ".lengths",
+                build_opts.output_prefix + ".lengths",
+                std::filesystem::copy_options::overwrite_existing,
+                ec);
+            if (ec) {
+                FATAL_ERROR(("Failed to copy lengths to output prefix: " + ec.message()).c_str());
+            }
+        }
+    } else if (build_opts.use_sail) {
+        STATUS_LOG("build_main", "streaming input to grl_text");
+        input_file_status = ref_build.build_sail_grl_text(build_opts.output_prefix + ".grl_text");
+    } else if (build_opts.use_gsacak || build_opts.from_parse_flag) {
+        STATUS_LOG("build_main", "parsing input files");
+        input_file_status = ref_build.build_input_file(
+            build_opts.pfp_w, build_opts.hash_mod, true, build_opts.use_gsacak,
+            build_opts.keep_temp || build_opts.only_parse);
+    } else {
+        STATUS_LOG("build_main", "computing PFP over input files");
+        input_file_status = ref_build.build_input_file(
+            build_opts.pfp_w, build_opts.hash_mod, true, false,
+            build_opts.keep_temp || build_opts.only_parse);
+    }
     if (input_file_status == 1) {
         remove_temp_files(build_opts.output_prefix);
         FATAL_ERROR("Please check the input files and ensure that it contains valid FASTA files. Cleaning up...");
-    }
-    // Mirror lengths under -o so downstream tools (extract, coverage) find PREFIX.lengths
-    if (build_opts.from_rlbwt_lengths &&
-        build_opts.rlbwt_prefix != build_opts.output_prefix) {
-        std::error_code ec;
-        std::filesystem::copy_file(
-            build_opts.rlbwt_prefix + ".lengths",
-            build_opts.output_prefix + ".lengths",
-            std::filesystem::copy_options::overwrite_existing,
-            ec);
-        if (ec) {
-            FATAL_ERROR(("Failed to copy lengths to output prefix: " + ec.message()).c_str());
-        }
     }
     DONE_LOG((std::chrono::system_clock::now() - start));
 

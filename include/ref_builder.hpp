@@ -38,7 +38,12 @@ public:
     RefBuilder(const std::vector<std::vector<size_t>>& lengths, bool use_rcomp);
     
     int build_input_file(size_t w, size_t p, bool probing, bool keep_seqs, bool write_pfp_files=false);
-    int build_input_file_lib(const std::vector<std::vector<std::string>>& sequences, bool keep_seqs);      
+    int build_input_file_lib(const std::vector<std::vector<std::string>>& sequences, bool keep_seqs);
+    // Stream FASTAs to a grlBWT plain-text file (seq$ [rc$] ... \0). Does not fill `text`
+    // and does not build doc_ends; SAIL uses streamed DA instead of the bitvector.
+    int build_sail_grl_text(const std::string& grl_path);
+    // Sum seq_lengths into total_length. Does not allocate doc_ends.
+    void set_total_length();
 
     // only used for direct_gsacak
     std::vector<uint8_t> text;

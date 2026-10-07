@@ -1,7 +1,9 @@
 /*
  * File: sail_lcp.hpp
- * Description: SAIL backend. grlBWT builds the RLBWT of RefBuilder::text;
- *              SAIL streams BWT/LCP/SA/DA into mem_finder.
+ * Description: SAIL backend. grlBWT builds the RLBWT of a streamed .grl_text
+ *              (not RefBuilder::text). SAIL streams BWT/LCP/SA/DA into mem_finder.
+ *              Document ids come from SAIL DA. The SDSL doc_ends bitvector is
+ *              not used here; PFP, gsacak, and --arrays-in still rank that bitvector.
  */
 #ifndef SAIL_LCP_HH
 #define SAIL_LCP_HH
@@ -103,14 +105,13 @@ public:
                 printProgress(static_cast<double>(j) / static_cast<double>(text_size));
             }
             const size_t sa = static_cast<size_t>(it.sa());
-            const size_t doc = ref_build->doc_ends_rank(sa);
-#ifndef NDEBUG
-            if (sa < doc_span) {
-                assert(static_cast<size_t>(it.da()) == doc);
-            }
-#else
-            (void)doc_span;
-#endif
+            // DA replaces doc_ends_rank on the SAIL path only (including -R).
+            // PFP, gsacak, and --arrays-in still use the bitvector; DA cannot
+            // replace those. Lengths still build da_offsets. The EOF symbol
+            // (sa == total_length) is outside every document.
+            const size_t doc = (sa < doc_span)
+                                   ? static_cast<size_t>(it.da())
+                                   : ref_build->num_docs;
             count += match_finder.update(j, static_cast<uint8_t>(it.bwt()), doc, sa,
                                           static_cast<size_t>(it.lcp()));
         }
@@ -136,20 +137,10 @@ private:
     }
 
     void build_rlbwt_with_grlbwt() {
-        if (ref_build->text.empty() || ref_build->text.back() != static_cast<uint8_t>('$')) {
-            FATAL_ERROR("SAIL backend: concatenated text must be non-empty and end with '$'");
-        }
+        // .grl_text is written by RefBuilder::build_sail_grl_text (seq$ [rc$] ... \0).
         const std::string text_path = prefix + ".grl_text";
-        {
-            std::ofstream out(text_path, std::ios::binary | std::ios::trunc);
-            if (!out) {
-                FATAL_ERROR(("failed to write " + text_path).c_str());
-            }
-            out.write(reinterpret_cast<const char*>(ref_build->text.data()),
-                      static_cast<std::streamsize>(ref_build->text.size()));
-            // EOF byte. PFP's BWT is this text plus one trailing 0, and that 0
-            // is grlBWT's only separator, so the file is a single string.
-            out.put('\0');
+        if (!is_file(text_path)) {
+            FATAL_ERROR(("SAIL backend: missing " + text_path).c_str());
         }
 
         std::filesystem::path tmp_dir = std::filesystem::path(prefix).parent_path();
@@ -171,7 +162,9 @@ private:
         }
         rl_bwt_to_heads_len(rl_path, prefix);
         std::filesystem::remove(rl_path);
-        std::filesystem::remove(text_path);
+        if (!keep_temp) {
+            std::filesystem::remove(text_path);
+        }
         DONE_LOG((std::chrono::system_clock::now() - grl_start));
         rlbwt_base = prefix;
     }
@@ -260,9 +253,6 @@ private:
             domain += static_cast<size_t>(value);
         }
         const size_t expect = ref_build->total_length + 1;
-        if (!ref_build->text.empty() && domain != ref_build->text.size() + 1) {
-            FATAL_ERROR("RLBWT domain does not match concatenated text length + EOF");
-        }
         if (domain != expect) {
             FATAL_ERROR("RLBWT domain does not match RefBuilder::total_length + EOF");
         }
