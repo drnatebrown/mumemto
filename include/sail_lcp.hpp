@@ -10,9 +10,11 @@
 
 #include <sail.hpp>
 
+#include <mem_chunks.hpp>
 #include <ref_builder.hpp>
 #include <pfp_mum.hpp>
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
@@ -89,11 +91,16 @@ public:
             return;
         }
 
+        // Checkpoints let process() split the stream. Keep at least SAIL's
+        // default so a later -R -t run can still use several chunks, and more
+        // when -t asks for it. SAIL caps the count at the text length.
+        const size_t n_chunks = std::max(threads, sail::default_max_chunks);
         stream.emplace(sail::make_stream(heads, lengths)
                            .with_bwt()
                            .with_lcp()
                            .with_da(da_offsets)
                            .threads(threads)
+                           .max_chunks(n_chunks)
                            .fast()
                            .forward());
         heads.clear();
@@ -124,10 +131,47 @@ public:
         if (!stream) {
             FATAL_ERROR("SAIL stream was not constructed");
         }
-        size_t count = 0;
-        size_t j = 0;
         const size_t doc_span = ref_build->total_length;
         const size_t text_size = doc_span + 1;
+        const size_t domain = static_cast<size_t>(stream->end_index());
+        size_t parts_n = threads;
+        if (stream->max_chunks() == 0 || parts_n <= 1 || domain <= 1) {
+            return process_serial(match_finder, doc_span, text_size);
+        }
+        if (parts_n > stream->max_chunks())
+            parts_n = stream->max_chunks();
+        if (parts_n <= 1)
+            return process_serial(match_finder, doc_span, text_size);
+
+        auto parts = stream->chunks(parts_n);
+        const bool overlap = match_finder.max_freq > 0;
+        const size_t width = overlap ? static_cast<size_t>(match_finder.max_freq) : 0;
+        auto decode = [&](auto& it) {
+            const size_t sa = static_cast<size_t>(it.sa());
+            // DA replaces doc_ends_rank on the SAIL path only (including -R).
+            // The EOF symbol (sa == total_length) is outside every document.
+            const size_t doc = (sa < doc_span) ? static_cast<size_t>(it.da())
+                                                : ref_build->num_docs;
+            return stream_row{static_cast<uint8_t>(it.bwt()), doc, sa,
+                              static_cast<size_t>(it.lcp())};
+        };
+        auto make_part = [&](int id) {
+            return std::make_unique<mem_finder>(
+                match_finder.filename, *ref_build, match_finder.min_mem_length,
+                match_finder.num_distinct, match_finder.max_doc_freq, match_finder.max_freq,
+                match_finder.binary, match_finder.merge, match_finder.anchor_merge, id);
+        };
+        const size_t count = run_chunked_match_finding(
+            match_finder, parts, domain, overlap, width, decode, make_part);
+        printProgress(1.0);
+        return count;
+    }
+
+private:
+    template <class T>
+    size_t process_serial(T& match_finder, size_t doc_span, size_t text_size) {
+        size_t count = 0;
+        size_t j = 0;
         size_t pb_inc = text_size / PBWIDTH;
         if (pb_inc == 0) pb_inc = 1;
         for (auto it = stream->begin(); it != stream->end(); ++it, ++j) {
@@ -135,13 +179,8 @@ public:
                 printProgress(static_cast<double>(j) / static_cast<double>(text_size));
             }
             const size_t sa = static_cast<size_t>(it.sa());
-            // DA replaces doc_ends_rank on the SAIL path only (including -R).
-            // PFP, gsacak, and --arrays-in still use the bitvector; DA cannot
-            // replace those. Lengths still build da_offsets. The EOF symbol
-            // (sa == total_length) is outside every document.
-            const size_t doc = (sa < doc_span)
-                                   ? static_cast<size_t>(it.da())
-                                   : ref_build->num_docs;
+            const size_t doc = (sa < doc_span) ? static_cast<size_t>(it.da())
+                                                : ref_build->num_docs;
             count += match_finder.update(j, static_cast<uint8_t>(it.bwt()), doc, sa,
                                           static_cast<size_t>(it.lcp()));
         }

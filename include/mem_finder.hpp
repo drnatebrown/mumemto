@@ -30,10 +30,37 @@
 #include <unordered_set>
 #include <filesystem>
 
+#include <algorithm>
 #include <deque>
+#include <limits>
 
 class mem_finder{
 public:
+    struct binary_record {
+        size_t close_j = 0;
+        uint32_t length = 0;
+        std::vector<int64_t> starts;
+        std::vector<char> strand;
+    };
+
+    // Open LCP-interval stack and the SA/BWT/DA rows it still needs.
+    struct frontier {
+        std::vector<std::pair<std::pair<size_t, size_t>, size_t>> mems;
+        size_t prev_lcp = 0;
+        size_t last_bwt_change = 0;
+        size_t buffer_start = 0;
+        std::deque<size_t> sa;
+        std::deque<uint8_t> bwt;
+        std::deque<size_t> da;
+        bool saw_real_bwt_change = false;
+    };
+
+    enum class keep_mode {
+        all,
+        right_range,     // right endpoint in [keep_lo, keep_hi)
+        interior,        // start > keep_lo && right < keep_hi
+        not_interior     // complement of interior (boundary stitch)
+    };
 
     size_t min_mem_length;
     size_t num_distinct;
@@ -50,7 +77,7 @@ public:
     bool anchor_merge;
     std::string filename;
 
-    mem_finder(std::string filename, RefBuilder& ref_build, size_t min_mem_len, size_t num_distinct, int max_doc_freq, int max_total_freq, bool binary, bool merge, bool anchor_merge): 
+    mem_finder(std::string filename, RefBuilder& ref_build, size_t min_mem_len, size_t num_distinct, int max_doc_freq, int max_total_freq, bool binary, bool merge, bool anchor_merge, int part_id = -1): 
                 min_mem_length(min_mem_len),
                 num_docs(ref_build.num_docs),
                 revcomp(ref_build.use_revcomp),
@@ -87,22 +114,188 @@ public:
         // Set parameters and limits
         // this->max_freq = num_docs + max_freq;
         this->no_max_freq = max_freq == 0;
-        // Opening output file
-        if (!mummode)
-            mem_file.open(filename + std::string(".mems"));
-        else if (binary)
-        {
-            bums_lengths.open(filename + std::string(".bumbl.lengths"), std::ios::binary);
-            bums_starts.open(filename + std::string(".bumbl.starts"), std::ios::binary);
-            bums_strands.open(filename + std::string(".bumbl.strands"), std::ios::binary);
+        // Part workers write a private file (or buffer binary records) so threads
+        // do not share the final output stream.
+        suppress_side_files = part_id >= 0;
+        const std::string base = suppress_side_files
+                                     ? filename + ".part" + std::to_string(part_id)
+                                     : filename;
+        if (!mummode) {
+            text_path = base + ".mems";
+            mem_file.open(text_path);
+        } else if (binary) {
+            if (!suppress_side_files) {
+                bums_lengths.open(filename + std::string(".bumbl.lengths"), std::ios::binary);
+                bums_starts.open(filename + std::string(".bumbl.starts"), std::ios::binary);
+                bums_strands.open(filename + std::string(".bumbl.strands"), std::ios::binary);
+            }
+        } else {
+            text_path = base + ".mums";
+            mem_file.open(text_path);
         }
-            
-        else
-            mem_file.open(filename + std::string(".mums"));
+    }
+
+    void enable_close_index_prefix() { prefix_close_j = true; }
+
+    void set_keep_all() { keep = keep_mode::all; }
+
+    void set_keep_right_range(size_t right_lo, size_t right_hi) {
+        keep = keep_mode::right_range;
+        keep_lo = right_lo;
+        keep_hi = right_hi;
+    }
+
+    // left is exclusive: intervals that start at or before the chunk cut are
+    // not emitted here (they may be truncated). right_hi is exclusive.
+    void set_keep_interior(size_t left, size_t right_hi) {
+        keep = keep_mode::interior;
+        keep_lo = left;
+        keep_hi = right_hi;
+    }
+
+    void set_keep_not_interior(size_t left, size_t right_hi) {
+        keep = keep_mode::not_interior;
+        keep_lo = left;
+        keep_hi = right_hi;
+    }
+
+    // Seed index j as the left edge of a fresh window. Does not open an
+    // interval starting at j-1 (that suffix was not visited).
+    inline void prime(size_t j, uint8_t bwt_c, size_t doc, size_t sa_entry, size_t lcp) {
+        if (bwt_buffer.empty() || bwt_buffer.back() != bwt_c)
+            last_bwt_change = j;
+        update_buffers(j, bwt_c, sa_entry, lcp, doc);
+        prev_lcp = lcp;
+    }
+
+    bool stack_idle() const { return current_mems.size() <= 1; }
+
+    frontier capture_frontier() const {
+        frontier out;
+        out.mems = current_mems;
+        out.prev_lcp = prev_lcp;
+        out.last_bwt_change = last_bwt_change;
+        out.buffer_start = buffer_start;
+        out.sa = sa_buffer;
+        out.bwt = bwt_buffer;
+        out.da = da_buffer;
+        out.saw_real_bwt_change = saw_real_bwt_change;
+        return out;
+    }
+
+    void restore_frontier(const frontier& in) {
+        current_mems = in.mems;
+        if (current_mems.empty())
+            current_mems.push_back(std::make_pair(std::make_pair(0, 0), 0));
+        prev_lcp = in.prev_lcp;
+        last_bwt_change = in.last_bwt_change;
+        buffer_start = in.buffer_start;
+        sa_buffer = in.sa;
+        bwt_buffer = in.bwt;
+        da_buffer = in.da;
+        saw_real_bwt_change = in.saw_real_bwt_change;
+    }
+
+    void absorb_merge_state(const mem_finder& other) {
+        if (!merge && !anchor_merge)
+            return;
+        mum_positions.insert(mum_positions.end(), other.mum_positions.begin(), other.mum_positions.end());
+        if (candidate_thresh.size() < other.candidate_thresh.size())
+            candidate_thresh.resize(other.candidate_thresh.size(), 0);
+        for (size_t i = 0; i < other.candidate_thresh.size(); ++i) {
+            if (other.candidate_thresh[i] > candidate_thresh[i])
+                candidate_thresh[i] = other.candidate_thresh[i];
+        }
+    }
+
+    std::vector<binary_record> release_binary() { return std::move(bin_recs); }
+
+    const std::string& part_text_path() const { return text_path; }
+
+    // Write merged binary records into this finder's bumbl intermediates.
+    // close() then packs them. Records must already be in output order.
+    void adopt_binary_records(const std::vector<binary_record>& recs) {
+        for (const auto& rec : recs) {
+            bums_lengths.write(reinterpret_cast<const char*>(&rec.length), sizeof(rec.length));
+            bums_starts.write(reinterpret_cast<const char*>(rec.starts.data()),
+                              sizeof(int64_t) * rec.starts.size());
+            bums_strands_vec.push_back(rec.strand);
+        }
+    }
+
+    // interiors are concatenated in order (increasing close index). If tagged,
+    // each line is "close_j\\tbody". An optional stitch file is merged in,
+    // with interior lines winning ties at the same close index (inner LCP
+    // intervals pop before the outer straddlers).
+    void write_merged_text(const std::vector<std::string>& interior_paths, const std::string& stitch_path, bool tagged) {
+        std::vector<std::ifstream> interiors;
+        interiors.reserve(interior_paths.size());
+        for (const auto& path : interior_paths) {
+            interiors.emplace_back(path);
+        }
+        std::ifstream stitch;
+        if (!stitch_path.empty())
+            stitch.open(stitch_path);
+
+        auto pull = [&](std::istream& in, bool& ok, size_t& j, std::string& body) {
+            std::string line;
+            if (!std::getline(in, line)) {
+                ok = false;
+                return;
+            }
+            ok = true;
+            if (!tagged) {
+                j = 0;
+                body = std::move(line);
+                return;
+            }
+            const auto tab = line.find('\t');
+            if (tab == std::string::npos)
+                FATAL_ERROR("chunked match line is missing its close index");
+            j = static_cast<size_t>(std::stoull(line.substr(0, tab)));
+            body = line.substr(tab + 1);
+        };
+
+        size_t ip = 0;
+        bool iok = false;
+        size_t ij = 0;
+        std::string ibody;
+        auto pull_interior = [&]() {
+            iok = false;
+            while (ip < interiors.size()) {
+                pull(interiors[ip], iok, ij, ibody);
+                if (iok)
+                    return;
+                ++ip;
+            }
+        };
+        pull_interior();
+
+        bool sok = false;
+        size_t sj = 0;
+        std::string sbody;
+        if (stitch.is_open())
+            pull(stitch, sok, sj, sbody);
+
+        while (iok || sok) {
+            const bool take_interior = iok && (!sok || ij < sj || (tagged && ij == sj));
+            if (take_interior) {
+                mem_file << ibody << '\n';
+                pull_interior();
+            } else {
+                mem_file << sbody << '\n';
+                pull(stitch, sok, sj, sbody);
+            }
+        }
     }
 
     virtual void close()
     {
+        if (suppress_side_files) {
+            if (mem_file.is_open())
+                mem_file.close();
+            return;
+        }
         if (binary)
             write_bums();
         else
@@ -162,6 +355,8 @@ public:
     {   
         // bwt last change checker
         size_t count = update_mems(j, lcp);
+        if (!bwt_buffer.empty() && bwt_buffer.back() != bwt_c)
+            saw_real_bwt_change = true;
         if (bwt_buffer.size() == 0 || bwt_buffer.back() != bwt_c)
             last_bwt_change = j;
         update_buffers(j, bwt_c, sa_entry, lcp, doc);
@@ -255,7 +450,7 @@ protected:
         //     min_offset_strand = curstrand;
         // }
         // if (min_offset_strand == '+')
-            mem_file << std::to_string(length) << '\t' << pos << '\t' << docs << '\t' << strand << std::endl;
+            emit_line(std::to_string(length) + '\t' + pos + '\t' + docs + '\t' + strand);
         return 1;
     }
 
@@ -307,6 +502,7 @@ private:
         size_t prev = 0;
         size_t next_best = 0;
         size_t start_offset = 0;
+        emit_close_j = j;
         std::pair<size_t, size_t> interval;
         while (lcp < current_mems.back().first.second) {
             interval = current_mems.back().first;
@@ -317,6 +513,7 @@ private:
             if (interval.second >= min_mem_length && 
                 j - interval.first >= num_distinct && 
                 (no_max_freq || j - interval.first <= max_freq) &&
+                keep_interval(interval.first, j - 1) &&
                 // !check_bwt_range(interval.first, j-1) && 
                 check_doc_range(interval.first, j-1)) 
                 {
@@ -394,10 +591,19 @@ private:
         
         if (binary) {
             uint32_t length_uint32 = static_cast<uint32_t>(length);
-            bums_lengths.write(reinterpret_cast<const char*>(&length_uint32), sizeof(length_uint32));
             std::vector<int64_t> converted(offsets.begin(), offsets.end());
-            bums_starts.write(reinterpret_cast<const char*>(converted.data()), sizeof(int64_t) * offsets.size());
-            bums_strands_vec.push_back(strand);
+            if (suppress_side_files) {
+                binary_record rec;
+                rec.close_j = emit_close_j;
+                rec.length = length_uint32;
+                rec.starts = std::move(converted);
+                rec.strand = strand;
+                bin_recs.push_back(std::move(rec));
+            } else {
+                bums_lengths.write(reinterpret_cast<const char*>(&length_uint32), sizeof(length_uint32));
+                bums_starts.write(reinterpret_cast<const char*>(converted.data()), sizeof(int64_t) * offsets.size());
+                bums_strands_vec.push_back(strand);
+            }
         }
         else {
             for (int i = 0; i < num_docs - 1; i++)
@@ -419,7 +625,7 @@ private:
                 pos_string += std::to_string(offsets[num_docs - 1]);
                 strand_string += strand[num_docs - 1];
             }
-            mem_file << std::to_string(length) << '\t' << pos_string << '\t' << strand_string << std::endl;
+            emit_line(std::to_string(length) + '\t' + pos_string + '\t' + strand_string);
         }
         return 1;
     }
@@ -503,6 +709,37 @@ private:
     {
         current_mems.push_back(std::make_pair(std::make_pair(0, 0), 0));
     }
+
+    bool keep_interval(size_t start, size_t right) const {
+        switch (keep) {
+            case keep_mode::all:
+                return true;
+            case keep_mode::right_range:
+                return right >= keep_lo && right < keep_hi;
+            case keep_mode::interior:
+                return start > keep_lo && right < keep_hi;
+            case keep_mode::not_interior:
+                return !(start > keep_lo && right < keep_hi);
+        }
+        return true;
+    }
+
+    void emit_line(const std::string& line) {
+        if (prefix_close_j)
+            mem_file << emit_close_j << '\t' << line << '\n';
+        else
+            mem_file << line << '\n';
+    }
+
+    bool suppress_side_files = false;
+    bool prefix_close_j = false;
+    std::string text_path;
+    keep_mode keep = keep_mode::all;
+    size_t keep_lo = 0;
+    size_t keep_hi = std::numeric_limits<size_t>::max();
+    size_t emit_close_j = 0;
+    bool saw_real_bwt_change = false;
+    std::vector<binary_record> bin_recs;
 };
 
 #endif /* end of include guard: _MEM_HH */
