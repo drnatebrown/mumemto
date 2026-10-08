@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -63,23 +64,31 @@ public:
         rlbwt_base = rlbwt_prefix.empty() ? prefix : std::move(rlbwt_prefix);
         build_da_offsets();
 
-        // Like PFP's -p: only reuse sidecars when -R is passed explicitly.
+        // -R reuses PREFIX.sail (like PFP -p reuses .parse/.dict). Otherwise build.
         if (!own_rlbwt) {
-            if (!is_file(rlbwt_base + ".bwt.heads") || !is_file(rlbwt_base + ".bwt.len")) {
-                FATAL_ERROR(("RLBWT sidecars missing at " + rlbwt_base).c_str());
+            if (!is_file(rlbwt_base + ".sail")) {
+                FATAL_ERROR(("SAIL index missing at " + rlbwt_base + ".sail").c_str());
             }
-            load_rlbwt(rlbwt_base);
         } else {
             build_rlbwt_with_grlbwt();
-            load_rlbwt(rlbwt_base);
-            if (!keep_temp) {
-                std::filesystem::remove(rlbwt_base + ".bwt.heads");
-                std::filesystem::remove(rlbwt_base + ".bwt.len");
-            }
         }
     }
 
     void construct() {
+        if (!own_rlbwt) {
+            std::ifstream in(rlbwt_base + ".sail", std::ios::binary);
+            if (!in) {
+                FATAL_ERROR(("failed to open " + rlbwt_base + ".sail").c_str());
+            }
+            stream.emplace();
+            try {
+                stream->load(in);
+            } catch (const std::exception& ex) {
+                FATAL_ERROR(ex.what());
+            }
+            return;
+        }
+
         stream.emplace(sail::make_stream(heads, lengths)
                            .with_bwt()
                            .with_lcp()
@@ -87,6 +96,27 @@ public:
                            .threads(threads)
                            .fast()
                            .forward());
+        heads.clear();
+        lengths.clear();
+        heads.shrink_to_fit();
+        lengths.shrink_to_fit();
+
+        if (!keep_temp) {
+            return;
+        }
+        const std::string sail_path = prefix + ".sail";
+        std::ofstream out(sail_path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            FATAL_ERROR(("failed to write " + sail_path).c_str());
+        }
+        try {
+            stream->serialize(out);
+        } catch (const std::exception& ex) {
+            FATAL_ERROR(ex.what());
+        }
+        if (!out) {
+            FATAL_ERROR(("failed while writing " + sail_path).c_str());
+        }
     }
 
     template <class T>
@@ -160,16 +190,14 @@ private:
         if (!is_file(rl_path)) {
             FATAL_ERROR(("grlBWT did not write " + rl_path).c_str());
         }
-        rl_bwt_to_heads_len(rl_path, prefix);
+        load_rl_bwt(rl_path);
         std::filesystem::remove(rl_path);
-        if (!keep_temp) {
-            std::filesystem::remove(text_path);
-        }
+        std::filesystem::remove(text_path);
         DONE_LOG((std::chrono::system_clock::now() - grl_start));
         rlbwt_base = prefix;
     }
 
-    static void rl_bwt_to_heads_len(const std::string& rl_path, const std::string& out_prefix) {
+    void load_rl_bwt(const std::string& rl_path) {
         std::ifstream in(rl_path, std::ios::binary);
         if (!in) {
             FATAL_ERROR(("failed to open " + rl_path).c_str());
@@ -182,14 +210,10 @@ private:
             FATAL_ERROR("invalid grlBWT .rl_bwt header");
         }
 
-        std::ofstream heads(out_prefix + ".bwt.heads", std::ios::binary | std::ios::trunc);
-        std::ofstream lens(out_prefix + ".bwt.len", std::ios::binary | std::ios::trunc);
-        if (!heads || !lens) {
-            FATAL_ERROR("failed to open RLBWT sidecar outputs");
-        }
-
         std::vector<unsigned char> rec(static_cast<size_t>(sb + fb));
-        uint64_t runs = 0;
+        heads.clear();
+        lengths.clear();
+        size_t domain = 0;
         while (in.read(reinterpret_cast<char*>(rec.data()),
                        static_cast<std::streamsize>(rec.size()))) {
             uint64_t sym = 0;
@@ -199,58 +223,12 @@ private:
             if (len == 0 || sym > 255) {
                 FATAL_ERROR("invalid run in .rl_bwt");
             }
-            heads.put(static_cast<char>(sym));
-            unsigned char buf[5];
-            for (size_t b = 0; b < 5; ++b) {
-                buf[b] = static_cast<unsigned char>((len >> (8 * b)) & 0xffu);
-            }
-            lens.write(reinterpret_cast<char*>(buf), 5);
-            ++runs;
+            heads.push_back(static_cast<sail::symbol_type>(sym));
+            lengths.push_back(static_cast<sail::length_type>(len));
+            domain += static_cast<size_t>(len);
         }
-        if (runs == 0) {
+        if (heads.empty()) {
             FATAL_ERROR(".rl_bwt contained no runs");
-        }
-    }
-
-    void load_rlbwt(const std::string& base) {
-        const std::string heads_path = base + ".bwt.heads";
-        const std::string lens_path = base + ".bwt.len";
-        std::ifstream hin(heads_path, std::ios::binary);
-        std::ifstream lin(lens_path, std::ios::binary);
-        if (!hin || !lin) {
-            FATAL_ERROR(("failed to open RLBWT sidecars at " + base).c_str());
-        }
-        hin.seekg(0, std::ios::end);
-        const auto nruns = static_cast<size_t>(hin.tellg());
-        hin.seekg(0, std::ios::beg);
-        lin.seekg(0, std::ios::end);
-        const auto len_bytes = static_cast<size_t>(lin.tellg());
-        lin.seekg(0, std::ios::beg);
-        if (len_bytes != nruns * 5) {
-            FATAL_ERROR("RLBWT .bwt.len size does not match heads");
-        }
-        heads.resize(nruns);
-        lengths.resize(nruns);
-        if (nruns != 0 &&
-            !hin.read(reinterpret_cast<char*>(heads.data()),
-                      static_cast<std::streamsize>(nruns))) {
-            FATAL_ERROR("failed reading heads");
-        }
-        unsigned char buf[5];
-        size_t domain = 0;
-        for (size_t i = 0; i < nruns; ++i) {
-            if (!lin.read(reinterpret_cast<char*>(buf), 5)) {
-                FATAL_ERROR("failed reading lengths");
-            }
-            sail::length_type value = 0;
-            for (size_t b = 0; b < 5; ++b) {
-                value |= static_cast<sail::length_type>(buf[b]) << (8 * b);
-            }
-            if (value == 0) {
-                FATAL_ERROR("zero-length BWT run");
-            }
-            lengths[i] = value;
-            domain += static_cast<size_t>(value);
         }
         const size_t expect = ref_build->total_length + 1;
         if (domain != expect) {

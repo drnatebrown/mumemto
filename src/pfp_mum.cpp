@@ -247,7 +247,7 @@ void print_build_status_info(BuildOptions& opts, RefBuilder& ref_build, bool mum
         std::fprintf(stderr, "\tUsing pre-computed PFP files with prefix: %s\n", opts.parse_prefix.data());
     }
     else if (opts.from_rlbwt_lengths) {
-        std::fprintf(stderr, "\tUsing sequence lengths from RLBWT prefix (N = %d): %s\n",
+        std::fprintf(stderr, "\tUsing SAIL index from prefix (N = %d): %s\n",
                      ref_build.num_docs, opts.rlbwt_prefix.data());
     }
     else if (opts.arrays_in.length() > 0)
@@ -278,7 +278,7 @@ void print_build_status_info(BuildOptions& opts, RefBuilder& ref_build, bool mum
         std::fprintf(stderr, "\tUsing SAIL to compute LCP, BWT, SA (threads=%d)\n",
                      static_cast<int>(opts.threads));
         if (!opts.rlbwt_prefix.empty()) {
-            std::fprintf(stderr, "\tRLBWT prefix: %s\n", opts.rlbwt_prefix.data());
+            std::fprintf(stderr, "\tSAIL index prefix: %s\n", opts.rlbwt_prefix.data());
         }
     }
     else if (!opts.from_parse_flag && !opts.arrays_in_flag)
@@ -405,11 +405,11 @@ int mumemto_usage() {
     std::fprintf(stderr, "\t%-22s%-10swindow size used for pfp (default: 10)\n", "-w, --window", "[INT]");
     std::fprintf(stderr, "\t%-22s%-10shash-modulus used for pfp (default: 100)\n", "-m, --modulus", "[INT]");
     std::fprintf(stderr, "\t%-32suse pre-computed pf-parse (with shared PREFIX.parse and PREFIX.dict)\n", "-p, --from-parse", "[PREFIX]");
-    std::fprintf(stderr, "\t%-32skeep PFP/SAIL files\n", "-K, --keep-temp-files");
+    std::fprintf(stderr, "\t%-32skeep PFP .dict/.parse or SAIL .sail\n", "-K, --keep-temp-files");
     std::fprintf(stderr, "\t%-32sskip PFP and use gsacak directly to compute LCP, BWT, SA\n", "-g, --use-gsacak");
     std::fprintf(stderr, "\t%-32sskip PFP and use SAIL to compute LCP, BWT, SA\n", "-S, --use-sail");
     std::fprintf(stderr, "\t%-22s%-10sthreads (default: 1)\n", "-t, --threads", "[INT]");
-    std::fprintf(stderr, "\t%-22s%-10sload existing <PREFIX>.bwt.heads/.bwt.len/.lengths instead of\n\t%-32srunning grlBWT / re-parsing FASTAs\n", "-R, --rlbwt-prefix", "[PREFIX]", "");
+    std::fprintf(stderr, "\t%-22s%-10sload existing <PREFIX>.sail/.lengths instead of running\n\t%-32sgrlBWT / building the SAIL stream\n", "-R, --rlbwt-prefix", "[PREFIX]", "");
     std::fprintf(stderr, "\t%-32sonly compute PFP over the input files and do not compute matches\n\n", "-P, --only-parse");
 
     std::fprintf(stderr, "Overview:\n");

@@ -79,16 +79,16 @@ struct BuildOptions {
         bool use_sail = false;
         size_t threads = 1;
         std::string rlbwt_prefix = "";
-        // When -R is set, also reuse PREFIX.lengths (skip FASTA re-parse), like PFP -p.
+        // When -R is set, reuse PREFIX.sail + PREFIX.lengths (skip FASTA and SAIL build).
         bool from_rlbwt_lengths = false;
 
         bool validate() {
             /* checks the arguments and make sure they are valid 
                returns MUM vs MEM designation based on input arguments*/
             if (!rlbwt_prefix.empty()) {
-                if (!is_file(rlbwt_prefix + ".bwt.heads") || !is_file(rlbwt_prefix + ".bwt.len")) {
-                    FATAL_ERROR(("Missing RLBWT sidecars for --rlbwt-prefix. Expected " +
-                                 rlbwt_prefix + ".bwt.heads and " + rlbwt_prefix + ".bwt.len").c_str());
+                if (!is_file(rlbwt_prefix + ".sail")) {
+                    FATAL_ERROR(("Missing SAIL index for --rlbwt-prefix. Expected file: " +
+                                 rlbwt_prefix + ".sail").c_str());
                 }
                 if (!is_file(rlbwt_prefix + ".lengths")) {
                     FATAL_ERROR(("Missing *.lengths for --rlbwt-prefix. Expected file: " +
@@ -109,7 +109,7 @@ struct BuildOptions {
                 FATAL_ERROR("Need to provide a file-list or files as positional args for processing.");
 
             if (from_rlbwt_lengths && (input_list.length() || files.size() > 0)) {
-                FORCE_LOG("build_main", "Reusing lengths from --rlbwt-prefix, ignoring FASTA inputs");
+                FORCE_LOG("build_main", "Reusing SAIL index from --rlbwt-prefix, ignoring FASTA inputs");
                 input_list.clear();
                 files.clear();
             }
