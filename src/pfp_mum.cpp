@@ -40,9 +40,9 @@ int build_main(int argc, char** argv) {
     bool mum_mode = build_opts.validate();
 
     // Declare ref_build first. SAIL -R / --from-rlbwt reuse PREFIX.lengths like PFP -p (no FASTA re-parse).
-    const bool from_lengths = build_opts.from_rlbwt_lengths || build_opts.from_rlbwt_runs;
+    const bool from_lengths = build_opts.from_sail_index || build_opts.from_rlbwt_runs;
     const std::string lengths_prefix = build_opts.from_rlbwt_runs ? build_opts.rlbwt_runs_prefix
-                                                                  : build_opts.rlbwt_prefix;
+                                                                  : build_opts.sail_prefix;
     RefBuilder ref_build =
         (build_opts.from_parse_flag || build_opts.arrays_in_flag)
             ? RefBuilder(build_opts.from_parse_flag ? build_opts.parse_prefix : build_opts.arrays_in,
@@ -59,11 +59,13 @@ int build_main(int argc, char** argv) {
     // print parameters and begin pipeline
     print_build_status_info(build_opts, ref_build, mum_mode);
 
-    // Build the input reference file. SAIL streams to .grl_text (or reuses -R lengths)
+    // Build the input reference file. SAIL streams to .grl_text (or reuses -R)
     // and does not build the doc_ends bitvector; PFP/gsacak still do.
+    // -R load of .lengths + .sail is timed together under the sail step below.
     auto start = std::chrono::system_clock::now();
     int input_file_status = 0;
-    if (build_opts.use_sail && (build_opts.from_rlbwt_lengths || build_opts.from_rlbwt_runs)) {
+    const bool reuse_sail_index = build_opts.use_sail && build_opts.from_sail_index;
+    if (build_opts.use_sail && build_opts.from_rlbwt_runs) {
         STATUS_LOG("build_main", "loading sequence lengths");
         ref_build.set_total_length();
         if (lengths_prefix != build_opts.output_prefix) {
@@ -95,7 +97,9 @@ int build_main(int argc, char** argv) {
         remove_temp_files(build_opts.output_prefix);
         FATAL_ERROR("Please check the input files and ensure that it contains valid FASTA files. Cleaning up...");
     }
-    DONE_LOG((std::chrono::system_clock::now() - start));
+    if (!reuse_sail_index) {
+        DONE_LOG((std::chrono::system_clock::now() - start));
+    }
 
     // skip PFP altogether, use gsacak directly
     if (build_opts.use_gsacak) {
@@ -119,12 +123,31 @@ int build_main(int argc, char** argv) {
     }
 
     if (build_opts.use_sail) {
+        if (reuse_sail_index) {
+            STATUS_LOG("sail", "loading SAIL index");
+            start = std::chrono::system_clock::now();
+            ref_build.set_total_length();
+            if (lengths_prefix != build_opts.output_prefix) {
+                std::error_code ec;
+                std::filesystem::copy_file(
+                    lengths_prefix + ".lengths",
+                    build_opts.output_prefix + ".lengths",
+                    std::filesystem::copy_options::overwrite_existing,
+                    ec);
+                if (ec) {
+                    FATAL_ERROR(("Failed to copy lengths to output prefix: " + ec.message()).c_str());
+                }
+            }
+        }
+
         sail_lcp sail(build_opts.output_prefix, &ref_build,
-                      build_opts.from_rlbwt_runs ? build_opts.rlbwt_runs_prefix : build_opts.rlbwt_prefix,
+                      build_opts.from_rlbwt_runs ? build_opts.rlbwt_runs_prefix : build_opts.sail_prefix,
                       build_opts.threads, build_opts.keep_temp, build_opts.from_rlbwt_runs);
 
-        STATUS_LOG("sail", "computing iterator for LCP, BWT, SA");
-        start = std::chrono::system_clock::now();
+        if (!reuse_sail_index) {
+            STATUS_LOG("sail", "computing iterator for LCP, BWT, SA");
+            start = std::chrono::system_clock::now();
+        }
         sail.construct();
         auto sec = std::chrono::duration<double>((std::chrono::system_clock::now() - start));
         std::fprintf(stderr, " done.  (%.3f sec)\n", sec.count());
@@ -250,9 +273,9 @@ void print_build_status_info(BuildOptions& opts, RefBuilder& ref_build, bool mum
     if (opts.from_parse_flag) {
         std::fprintf(stderr, "\tUsing pre-computed PFP files with prefix: %s\n", opts.parse_prefix.data());
     }
-    else if (opts.from_rlbwt_lengths) {
+    else if (opts.from_sail_index) {
         std::fprintf(stderr, "\tUsing SAIL index from prefix (N = %d): %s\n",
-                     ref_build.num_docs, opts.rlbwt_prefix.data());
+                     ref_build.num_docs, opts.sail_prefix.data());
     }
     else if (opts.from_rlbwt_runs) {
         std::fprintf(stderr, "\tBuilding SAIL from RLBWT sidecars (N = %d): %s\n",
@@ -285,8 +308,8 @@ void print_build_status_info(BuildOptions& opts, RefBuilder& ref_build, bool mum
     else if (opts.use_sail) {
         std::fprintf(stderr, "\tUsing SAIL to compute LCP, BWT, SA (threads=%d)\n",
                      static_cast<int>(opts.threads));
-        if (!opts.rlbwt_prefix.empty()) {
-            std::fprintf(stderr, "\tSAIL index prefix: %s\n", opts.rlbwt_prefix.data());
+        if (!opts.sail_prefix.empty()) {
+            std::fprintf(stderr, "\tSAIL index prefix: %s\n", opts.sail_prefix.data());
         } else if (opts.from_rlbwt_runs) {
             std::fprintf(stderr, "\tRLBWT sidecar prefix: %s\n", opts.rlbwt_runs_prefix.data());
         }
@@ -346,7 +369,7 @@ void parse_build_options(int argc, char** argv, BuildOptions* opts) {
         {"use-gsacak",   no_argument, NULL,  'g'},
         {"use-sail",     no_argument, NULL,  'S'},
         {"threads",      required_argument, NULL,  't'},
-        {"rlbwt-prefix", required_argument, NULL,  'R'},
+        {"sail-prefix",  required_argument, NULL,  'R'},
         {"from-rlbwt",   required_argument, NULL,  1000},
         {0, 0, 0,  0}
     };
@@ -376,7 +399,7 @@ void parse_build_options(int argc, char** argv, BuildOptions* opts) {
             case 'g': opts->use_gsacak = true; break;
             case 'S': opts->use_sail = true; break;
             case 't': opts->threads = static_cast<size_t>(std::atoi(optarg)); break;
-            case 'R': opts->rlbwt_prefix.assign(optarg); opts->use_sail = true; break;
+            case 'R': opts->sail_prefix.assign(optarg); opts->use_sail = true; break;
             case 1000: opts->rlbwt_runs_prefix.assign(optarg); opts->from_rlbwt_runs = true; opts->use_sail = true; break;
             case 'P': opts->only_parse = true; break;
             default: mumemto_usage(); std::exit(1);
@@ -421,7 +444,7 @@ int mumemto_usage() {
     std::fprintf(stderr, "\t%-32sskip PFP and use gsacak directly to compute LCP, BWT, SA\n", "-g, --use-gsacak");
     std::fprintf(stderr, "\t%-32sskip PFP and use SAIL to compute LCP, BWT, SA\n", "-S, --use-sail");
     std::fprintf(stderr, "\t%-22s%-10sthreads (default: 1)\n", "-t, --threads", "[INT]");
-    std::fprintf(stderr, "\t%-22s%-10sload existing <PREFIX>.sail/.lengths instead of running\n\t%-32sgrlBWT / building the SAIL stream\n", "-R, --rlbwt-prefix", "[PREFIX]", "");
+    std::fprintf(stderr, "\t%-22s%-10sload existing <PREFIX>.sail/.lengths instead of running\n\t%-32sgrlBWT / building the SAIL stream\n", "-R, --sail-prefix", "[PREFIX]", "");
     std::fprintf(stderr, "\t%-22s%-10sbuild the SAIL stream from existing <PREFIX>.bwt.heads,\n\t%-32s<PREFIX>.bwt.len, and <PREFIX>.lengths (does not load .sail)\n", "--from-rlbwt", "[PREFIX]", "");
     std::fprintf(stderr, "\t%-32sonly compute PFP over the input files and do not compute matches\n\n", "-P, --only-parse");
 

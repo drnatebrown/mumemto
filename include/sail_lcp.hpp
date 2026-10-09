@@ -49,7 +49,7 @@ public:
 
     RefBuilder* ref_build;
     std::string prefix;
-    std::string rlbwt_base;
+    std::string index_base;
     size_t threads;
     bool keep_temp;
     source_kind source;
@@ -58,26 +58,28 @@ public:
     std::vector<sail::offsets_type> da_offsets;
     std::optional<stream_type> stream;
 
-    sail_lcp(std::string output_prefix, RefBuilder* ref, std::string rlbwt_prefix,
+    // index_prefix is PREFIX for -R/--sail-prefix (.sail) or --from-rlbwt (RLBWT
+    // sidecars). Empty means build from FASTA via grlBWT.
+    sail_lcp(std::string output_prefix, RefBuilder* ref, std::string index_prefix,
              size_t n_threads, bool keep_temp_files, bool from_rlbwt_runs = false)
         : ref_build(ref),
           prefix(std::move(output_prefix)),
           threads(n_threads == 0 ? 1 : n_threads),
           keep_temp(keep_temp_files),
           source(from_rlbwt_runs ? source_kind::rlbwt_runs
-                                 : (rlbwt_prefix.empty() ? source_kind::build
+                                 : (index_prefix.empty() ? source_kind::build
                                                          : source_kind::sail_index)) {
-        rlbwt_base = rlbwt_prefix.empty() ? prefix : std::move(rlbwt_prefix);
+        index_base = index_prefix.empty() ? prefix : std::move(index_prefix);
         build_da_offsets();
 
         // -R reuses PREFIX.sail. --from-rlbwt loads .bwt.heads/.bwt.len and
         // rebuilds the stream. Otherwise run grlBWT.
         if (source == source_kind::sail_index) {
-            if (!is_file(rlbwt_base + ".sail")) {
-                FATAL_ERROR(("SAIL index missing at " + rlbwt_base + ".sail").c_str());
+            if (!is_file(index_base + ".sail")) {
+                FATAL_ERROR(("SAIL index missing at " + index_base + ".sail").c_str());
             }
         } else if (source == source_kind::rlbwt_runs) {
-            load_rlbwt(rlbwt_base);
+            load_rlbwt(index_base);
         } else {
             build_rlbwt_with_grlbwt();
         }
@@ -85,9 +87,9 @@ public:
 
     void construct() {
         if (source == source_kind::sail_index) {
-            std::ifstream in(rlbwt_base + ".sail", std::ios::binary);
+            std::ifstream in(index_base + ".sail", std::ios::binary);
             if (!in) {
-                FATAL_ERROR(("failed to open " + rlbwt_base + ".sail").c_str());
+                FATAL_ERROR(("failed to open " + index_base + ".sail").c_str());
             }
             stream.emplace();
             try {
@@ -240,7 +242,7 @@ private:
         std::filesystem::remove(rl_path);
         std::filesystem::remove(text_path);
         DONE_LOG((std::chrono::system_clock::now() - grl_start));
-        rlbwt_base = prefix;
+        index_base = prefix;
     }
 
     void load_rl_bwt(const std::string& rl_path) {

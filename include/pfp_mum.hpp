@@ -78,9 +78,9 @@ struct BuildOptions {
         bool only_parse = false;
         bool use_sail = false;
         size_t threads = 1;
-        std::string rlbwt_prefix = "";
+        std::string sail_prefix = "";
         // When -R is set, reuse PREFIX.sail + PREFIX.lengths (skip FASTA and SAIL build).
-        bool from_rlbwt_lengths = false;
+        bool from_sail_index = false;
         // --from-rlbwt: rebuild the SAIL stream from PREFIX.bwt.heads/.bwt.len/.lengths.
         std::string rlbwt_runs_prefix = "";
         bool from_rlbwt_runs = false;
@@ -88,20 +88,20 @@ struct BuildOptions {
         bool validate() {
             /* checks the arguments and make sure they are valid 
                returns MUM vs MEM designation based on input arguments*/
-            if (!rlbwt_prefix.empty() && from_rlbwt_runs) {
-                FATAL_ERROR("--from-rlbwt is incompatible with -R/--rlbwt-prefix");
+            if (!sail_prefix.empty() && from_rlbwt_runs) {
+                FATAL_ERROR("--from-rlbwt is incompatible with -R/--sail-prefix");
             }
-            if (!rlbwt_prefix.empty()) {
-                if (!is_file(rlbwt_prefix + ".sail")) {
-                    FATAL_ERROR(("Missing SAIL index for --rlbwt-prefix. Expected file: " +
-                                 rlbwt_prefix + ".sail").c_str());
+            if (!sail_prefix.empty()) {
+                if (!is_file(sail_prefix + ".sail")) {
+                    FATAL_ERROR(("Missing SAIL index for --sail-prefix. Expected file: " +
+                                 sail_prefix + ".sail").c_str());
                 }
-                if (!is_file(rlbwt_prefix + ".lengths")) {
-                    FATAL_ERROR(("Missing *.lengths for --rlbwt-prefix. Expected file: " +
-                                 rlbwt_prefix + ".lengths").c_str());
+                if (!is_file(sail_prefix + ".lengths")) {
+                    FATAL_ERROR(("Missing *.lengths for --sail-prefix. Expected file: " +
+                                 sail_prefix + ".lengths").c_str());
                 }
                 use_sail = true;
-                from_rlbwt_lengths = true;
+                from_sail_index = true;
             }
             if (from_rlbwt_runs) {
                 if (!is_file(rlbwt_runs_prefix + ".bwt.heads")) {
@@ -126,11 +126,11 @@ struct BuildOptions {
                 files.clear();
             }
             else if (input_list.length() == 0 && (files.size() == 0) &&
-                     (!from_parse_flag && !arrays_in_flag && !from_rlbwt_lengths && !from_rlbwt_runs))
+                     (!from_parse_flag && !arrays_in_flag && !from_sail_index && !from_rlbwt_runs))
                 FATAL_ERROR("Need to provide a file-list or files as positional args for processing.");
 
-            if (from_rlbwt_lengths && (input_list.length() || files.size() > 0)) {
-                FORCE_LOG("build_main", "Reusing SAIL index from --rlbwt-prefix, ignoring FASTA inputs");
+            if (from_sail_index && (input_list.length() || files.size() > 0)) {
+                FORCE_LOG("build_main", "Reusing SAIL index from --sail-prefix, ignoring FASTA inputs");
                 input_list.clear();
                 files.clear();
             }
