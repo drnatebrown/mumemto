@@ -81,10 +81,16 @@ struct BuildOptions {
         std::string rlbwt_prefix = "";
         // When -R is set, reuse PREFIX.sail + PREFIX.lengths (skip FASTA and SAIL build).
         bool from_rlbwt_lengths = false;
+        // --from-rlbwt: rebuild the SAIL stream from PREFIX.bwt.heads/.bwt.len/.lengths.
+        std::string rlbwt_runs_prefix = "";
+        bool from_rlbwt_runs = false;
 
         bool validate() {
             /* checks the arguments and make sure they are valid 
                returns MUM vs MEM designation based on input arguments*/
+            if (!rlbwt_prefix.empty() && from_rlbwt_runs) {
+                FATAL_ERROR("--from-rlbwt is incompatible with -R/--rlbwt-prefix");
+            }
             if (!rlbwt_prefix.empty()) {
                 if (!is_file(rlbwt_prefix + ".sail")) {
                     FATAL_ERROR(("Missing SAIL index for --rlbwt-prefix. Expected file: " +
@@ -97,6 +103,21 @@ struct BuildOptions {
                 use_sail = true;
                 from_rlbwt_lengths = true;
             }
+            if (from_rlbwt_runs) {
+                if (!is_file(rlbwt_runs_prefix + ".bwt.heads")) {
+                    FATAL_ERROR(("Missing RLBWT heads for --from-rlbwt. Expected file: " +
+                                 rlbwt_runs_prefix + ".bwt.heads").c_str());
+                }
+                if (!is_file(rlbwt_runs_prefix + ".bwt.len")) {
+                    FATAL_ERROR(("Missing RLBWT lengths for --from-rlbwt. Expected file: " +
+                                 rlbwt_runs_prefix + ".bwt.len").c_str());
+                }
+                if (!is_file(rlbwt_runs_prefix + ".lengths")) {
+                    FATAL_ERROR(("Missing *.lengths for --from-rlbwt. Expected file: " +
+                                 rlbwt_runs_prefix + ".lengths").c_str());
+                }
+                use_sail = true;
+            }
 
             if (input_list.length() && !is_file(input_list)) // provided a file-list
                 FATAL_ERROR("The provided file-list is not valid.");
@@ -105,11 +126,16 @@ struct BuildOptions {
                 files.clear();
             }
             else if (input_list.length() == 0 && (files.size() == 0) &&
-                     (!from_parse_flag && !arrays_in_flag && !from_rlbwt_lengths))
+                     (!from_parse_flag && !arrays_in_flag && !from_rlbwt_lengths && !from_rlbwt_runs))
                 FATAL_ERROR("Need to provide a file-list or files as positional args for processing.");
 
             if (from_rlbwt_lengths && (input_list.length() || files.size() > 0)) {
                 FORCE_LOG("build_main", "Reusing SAIL index from --rlbwt-prefix, ignoring FASTA inputs");
+                input_list.clear();
+                files.clear();
+            }
+            if (from_rlbwt_runs && (input_list.length() || files.size() > 0)) {
+                FORCE_LOG("build_main", "Building SAIL from --from-rlbwt, ignoring FASTA inputs");
                 input_list.clear();
                 files.clear();
             }
