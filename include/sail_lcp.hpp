@@ -1,16 +1,20 @@
 /*
  * File: sail_lcp.hpp
- * Description: SAIL backend. grlBWT builds the RLBWT of RefBuilder::text;
- *              SAIL streams BWT/LCP/SA/DA into mem_finder.
+ * Description: SAIL backend. grlBWT builds the RLBWT of a streamed .grl_text
+ *              (not RefBuilder::text). SAIL streams BWT/LCP/SA/DA into mem_finder.
+ *              Document ids come from SAIL DA. The SDSL doc_ends bitvector is
+ *              not used here; PFP, gsacak, and --arrays-in still rank that bitvector.
  */
 #ifndef SAIL_LCP_HH
 #define SAIL_LCP_HH
 
 #include <sail.hpp>
 
+#include <mem_chunks.hpp>
 #include <ref_builder.hpp>
 #include <pfp_mum.hpp>
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
@@ -20,6 +24,7 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -40,51 +45,92 @@ public:
                                      .fast()
                                      .forward());
 
+    enum class source_kind { build, sail_index, rlbwt_runs };
+
     RefBuilder* ref_build;
     std::string prefix;
     std::string rlbwt_base;
     size_t threads;
     bool keep_temp;
-    bool own_rlbwt;
+    source_kind source;
     std::vector<sail::symbol_type> heads;
     std::vector<sail::length_type> lengths;
     std::vector<sail::offsets_type> da_offsets;
     std::optional<stream_type> stream;
 
     sail_lcp(std::string output_prefix, RefBuilder* ref, std::string rlbwt_prefix,
-             size_t n_threads, bool keep_temp_files)
+             size_t n_threads, bool keep_temp_files, bool from_rlbwt_runs = false)
         : ref_build(ref),
           prefix(std::move(output_prefix)),
           threads(n_threads == 0 ? 1 : n_threads),
           keep_temp(keep_temp_files),
-          own_rlbwt(rlbwt_prefix.empty()) {
+          source(from_rlbwt_runs ? source_kind::rlbwt_runs
+                                 : (rlbwt_prefix.empty() ? source_kind::build
+                                                         : source_kind::sail_index)) {
         rlbwt_base = rlbwt_prefix.empty() ? prefix : std::move(rlbwt_prefix);
         build_da_offsets();
 
-        // Like PFP's -p: only reuse sidecars when -R is passed explicitly.
-        if (!own_rlbwt) {
-            if (!is_file(rlbwt_base + ".bwt.heads") || !is_file(rlbwt_base + ".bwt.len")) {
-                FATAL_ERROR(("RLBWT sidecars missing at " + rlbwt_base).c_str());
+        // -R reuses PREFIX.sail. --from-rlbwt loads .bwt.heads/.bwt.len and
+        // rebuilds the stream. Otherwise run grlBWT.
+        if (source == source_kind::sail_index) {
+            if (!is_file(rlbwt_base + ".sail")) {
+                FATAL_ERROR(("SAIL index missing at " + rlbwt_base + ".sail").c_str());
             }
+        } else if (source == source_kind::rlbwt_runs) {
             load_rlbwt(rlbwt_base);
         } else {
             build_rlbwt_with_grlbwt();
-            load_rlbwt(rlbwt_base);
-            if (!keep_temp) {
-                std::filesystem::remove(rlbwt_base + ".bwt.heads");
-                std::filesystem::remove(rlbwt_base + ".bwt.len");
-            }
         }
     }
 
     void construct() {
+        if (source == source_kind::sail_index) {
+            std::ifstream in(rlbwt_base + ".sail", std::ios::binary);
+            if (!in) {
+                FATAL_ERROR(("failed to open " + rlbwt_base + ".sail").c_str());
+            }
+            stream.emplace();
+            try {
+                stream->load(in);
+            } catch (const std::exception& ex) {
+                FATAL_ERROR(ex.what());
+            }
+            return;
+        }
+
+        // Checkpoints let process() split the stream. Keep at least SAIL's
+        // default so a later -R -t run can still use several chunks, and more
+        // when -t asks for it. SAIL caps the count at the text length.
+        const size_t n_chunks = std::max(threads, sail::default_max_chunks);
         stream.emplace(sail::make_stream(heads, lengths)
                            .with_bwt()
                            .with_lcp()
                            .with_da(da_offsets)
                            .threads(threads)
+                           .max_chunks(n_chunks)
                            .fast()
                            .forward());
+        heads.clear();
+        lengths.clear();
+        heads.shrink_to_fit();
+        lengths.shrink_to_fit();
+
+        if (!keep_temp) {
+            return;
+        }
+        const std::string sail_path = prefix + ".sail";
+        std::ofstream out(sail_path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            FATAL_ERROR(("failed to write " + sail_path).c_str());
+        }
+        try {
+            stream->serialize(out);
+        } catch (const std::exception& ex) {
+            FATAL_ERROR(ex.what());
+        }
+        if (!out) {
+            FATAL_ERROR(("failed while writing " + sail_path).c_str());
+        }
     }
 
     template <class T>
@@ -92,10 +138,46 @@ public:
         if (!stream) {
             FATAL_ERROR("SAIL stream was not constructed");
         }
-        size_t count = 0;
-        size_t j = 0;
         const size_t doc_span = ref_build->total_length;
         const size_t text_size = doc_span + 1;
+        const size_t domain = static_cast<size_t>(stream->end_index());
+        size_t parts_n = threads;
+        if (stream->max_chunks() == 0 || parts_n <= 1 || domain <= 1) {
+            return process_serial(match_finder, doc_span, text_size);
+        }
+        if (parts_n > stream->max_chunks())
+            parts_n = stream->max_chunks();
+        if (parts_n <= 1)
+            return process_serial(match_finder, doc_span, text_size);
+
+        auto parts = stream->chunks(parts_n);
+        const bool overlap = match_finder.max_freq > 0;
+        const size_t width = overlap ? static_cast<size_t>(match_finder.max_freq) : 0;
+        auto decode = [&](auto& it) {
+            const size_t sa = static_cast<size_t>(it.sa());
+            // The EOF symbol (sa == total_length) is outside every document.
+            const size_t doc = (sa < doc_span) ? static_cast<size_t>(it.da())
+                                                : ref_build->num_docs;
+            return stream_row{static_cast<uint8_t>(it.bwt()), doc, sa,
+                              static_cast<size_t>(it.lcp())};
+        };
+        auto make_part = [&](int id) {
+            return std::make_unique<mem_finder>(
+                match_finder.filename, *ref_build, match_finder.min_mem_length,
+                match_finder.num_distinct, match_finder.max_doc_freq, match_finder.max_freq,
+                match_finder.binary, match_finder.merge, match_finder.anchor_merge, id);
+        };
+        const size_t count = run_chunked_match_finding(
+            match_finder, parts, domain, overlap, width, decode, make_part);
+        printProgress(1.0);
+        return count;
+    }
+
+private:
+    template <class T>
+    size_t process_serial(T& match_finder, size_t doc_span, size_t text_size) {
+        size_t count = 0;
+        size_t j = 0;
         size_t pb_inc = text_size / PBWIDTH;
         if (pb_inc == 0) pb_inc = 1;
         for (auto it = stream->begin(); it != stream->end(); ++it, ++j) {
@@ -103,14 +185,9 @@ public:
                 printProgress(static_cast<double>(j) / static_cast<double>(text_size));
             }
             const size_t sa = static_cast<size_t>(it.sa());
-            const size_t doc = ref_build->doc_ends_rank(sa);
-#ifndef NDEBUG
-            if (sa < doc_span) {
-                assert(static_cast<size_t>(it.da()) == doc);
-            }
-#else
-            (void)doc_span;
-#endif
+            // The EOF symbol (sa == total_length) is outside every document.
+            const size_t doc = (sa < doc_span) ? static_cast<size_t>(it.da())
+                                                : ref_build->num_docs;
             count += match_finder.update(j, static_cast<uint8_t>(it.bwt()), doc, sa,
                                           static_cast<size_t>(it.lcp()));
         }
@@ -136,20 +213,10 @@ private:
     }
 
     void build_rlbwt_with_grlbwt() {
-        if (ref_build->text.empty() || ref_build->text.back() != static_cast<uint8_t>('$')) {
-            FATAL_ERROR("SAIL backend: concatenated text must be non-empty and end with '$'");
-        }
+        // .grl_text is written by RefBuilder::build_sail_grl_text (seq$ [rc$] ... \0).
         const std::string text_path = prefix + ".grl_text";
-        {
-            std::ofstream out(text_path, std::ios::binary | std::ios::trunc);
-            if (!out) {
-                FATAL_ERROR(("failed to write " + text_path).c_str());
-            }
-            out.write(reinterpret_cast<const char*>(ref_build->text.data()),
-                      static_cast<std::streamsize>(ref_build->text.size()));
-            // EOF byte. PFP's BWT is this text plus one trailing 0, and that 0
-            // is grlBWT's only separator, so the file is a single string.
-            out.put('\0');
+        if (!is_file(text_path)) {
+            FATAL_ERROR(("SAIL backend: missing " + text_path).c_str());
         }
 
         std::filesystem::path tmp_dir = std::filesystem::path(prefix).parent_path();
@@ -169,14 +236,14 @@ private:
         if (!is_file(rl_path)) {
             FATAL_ERROR(("grlBWT did not write " + rl_path).c_str());
         }
-        rl_bwt_to_heads_len(rl_path, prefix);
+        load_rl_bwt(rl_path);
         std::filesystem::remove(rl_path);
         std::filesystem::remove(text_path);
         DONE_LOG((std::chrono::system_clock::now() - grl_start));
         rlbwt_base = prefix;
     }
 
-    static void rl_bwt_to_heads_len(const std::string& rl_path, const std::string& out_prefix) {
+    void load_rl_bwt(const std::string& rl_path) {
         std::ifstream in(rl_path, std::ios::binary);
         if (!in) {
             FATAL_ERROR(("failed to open " + rl_path).c_str());
@@ -189,14 +256,10 @@ private:
             FATAL_ERROR("invalid grlBWT .rl_bwt header");
         }
 
-        std::ofstream heads(out_prefix + ".bwt.heads", std::ios::binary | std::ios::trunc);
-        std::ofstream lens(out_prefix + ".bwt.len", std::ios::binary | std::ios::trunc);
-        if (!heads || !lens) {
-            FATAL_ERROR("failed to open RLBWT sidecar outputs");
-        }
-
         std::vector<unsigned char> rec(static_cast<size_t>(sb + fb));
-        uint64_t runs = 0;
+        heads.clear();
+        lengths.clear();
+        size_t domain = 0;
         while (in.read(reinterpret_cast<char*>(rec.data()),
                        static_cast<std::streamsize>(rec.size()))) {
             uint64_t sym = 0;
@@ -206,19 +269,20 @@ private:
             if (len == 0 || sym > 255) {
                 FATAL_ERROR("invalid run in .rl_bwt");
             }
-            heads.put(static_cast<char>(sym));
-            unsigned char buf[5];
-            for (size_t b = 0; b < 5; ++b) {
-                buf[b] = static_cast<unsigned char>((len >> (8 * b)) & 0xffu);
-            }
-            lens.write(reinterpret_cast<char*>(buf), 5);
-            ++runs;
+            heads.push_back(static_cast<sail::symbol_type>(sym));
+            lengths.push_back(static_cast<sail::length_type>(len));
+            domain += static_cast<size_t>(len);
         }
-        if (runs == 0) {
+        if (heads.empty()) {
             FATAL_ERROR(".rl_bwt contained no runs");
+        }
+        const size_t expect = ref_build->total_length + 1;
+        if (domain != expect) {
+            FATAL_ERROR("RLBWT domain does not match RefBuilder::total_length + EOF");
         }
     }
 
+    // Load existing .bwt.heads (1 byte/run) and .bwt.len (5-byte LE length/run).
     void load_rlbwt(const std::string& base) {
         const std::string heads_path = base + ".bwt.heads";
         const std::string lens_path = base + ".bwt.len";
@@ -260,9 +324,6 @@ private:
             domain += static_cast<size_t>(value);
         }
         const size_t expect = ref_build->total_length + 1;
-        if (!ref_build->text.empty() && domain != ref_build->text.size() + 1) {
-            FATAL_ERROR("RLBWT domain does not match concatenated text length + EOF");
-        }
         if (domain != expect) {
             FATAL_ERROR("RLBWT domain does not match RefBuilder::total_length + EOF");
         }

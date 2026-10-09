@@ -168,16 +168,20 @@ RefBuilder::RefBuilder(std::string output_prefix, bool use_rcomp): use_revcomp(u
     this->num_docs = input_files.size();
 }
 
-void RefBuilder::build_bv() {
-    // Assuming seq_lengths has been built correctly
+void RefBuilder::set_total_length() {
     size_t total_input_length = 0;
     for (auto length: seq_lengths) {
         total_input_length += length;
     }
-
     this->total_length = total_input_length;
-    // sanity check
     ASSERT((this->num_docs == seq_lengths.size()), "Issue with file-list parsing occurred.");
+}
+
+void RefBuilder::build_bv() {
+    // Assuming seq_lengths has been built correctly.
+    // PFP, gsacak, and --arrays-in still need this bitvector. SAIL does not.
+    set_total_length();
+    const size_t total_input_length = this->total_length;
     
     // Build bitvector/rank support marking the end of each document
     doc_ends = sdsl::bit_vector(total_input_length, 0);
@@ -206,6 +210,102 @@ void RefBuilder::write_lengths_file() {
         }
     }
     outfile.close();
+}
+
+static unsigned char ascii_upper_tab[256];
+
+static void init_ascii_upper() {
+    static bool ready = false;
+    if (ready)
+        return;
+    for (int i = 0; i < 256; ++i) {
+        ascii_upper_tab[i] = static_cast<unsigned char>(i);
+    }
+    for (int c = 'a'; c <= 'z'; ++c) {
+        ascii_upper_tab[c] = static_cast<unsigned char>(c - 'a' + 'A');
+    }
+    ready = true;
+}
+
+static unsigned char ascii_upper(unsigned char c) {
+    return ascii_upper_tab[c];
+}
+
+int RefBuilder::build_sail_grl_text(const std::string& grl_path) {
+    /* One document at a time: uppercase, write bases + '$', optional RC + '$'.
+       Trailing 0 is grlBWT's only separator. Peak memory is one input file. */
+    if (from_parse) {
+        FATAL_ERROR("SAIL text streaming requires FASTA inputs, not a lengths-only build");
+    }
+    init_ascii_upper();
+    std::vector<char> io_buf(1 << 20);
+    std::ofstream out(grl_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        FATAL_ERROR(("failed to write " + grl_path).c_str());
+    }
+    out.rdbuf()->pubsetbuf(io_buf.data(), static_cast<std::streamsize>(io_buf.size()));
+
+    gzFile gzfp;
+    kseq_t* seq;
+    std::vector<std::string> seq_vec;
+    std::vector<size_t> temp_lengths;
+    std::vector<std::string> temp_names;
+
+    for (auto iter = input_files.begin(); iter != input_files.end(); ++iter) {
+        gzfp = gzopen((*iter).data(), "r");
+        if (gzfp == 0) {
+            FATAL_ERROR(("failed to open " + *iter).c_str());
+        }
+        seq = kseq_init(gzfp);
+        size_t dna = 0;
+        while (kseq_read(seq) >= 0) {
+            std::string record(seq->seq.s, seq->seq.l);
+            for (char& ch : record) {
+                ch = static_cast<char>(ascii_upper(static_cast<unsigned char>(ch)));
+            }
+            dna += record.size();
+            temp_lengths.push_back(record.size());
+            temp_names.push_back(seq->name.s);
+            seq_vec.push_back(std::move(record));
+        }
+        kseq_destroy(seq);
+        gzclose(gzfp);
+        if (dna == 0) {
+            std::cerr << std::endl << "Empty input file found: " + *iter << std::endl;
+            return 1;
+        }
+        multifasta_lengths.push_back(temp_lengths);
+        multifasta_names.push_back(temp_names);
+        temp_lengths.clear();
+        temp_names.clear();
+
+        for (const auto& s : seq_vec) {
+            out.write(s.data(), static_cast<std::streamsize>(s.size()));
+        }
+        out.put('$');
+        size_t doc_len = dna + 1;
+        if (use_revcomp) {
+            for (size_t i = seq_vec.size(); i-- != 0; ) {
+                rev_comp(seq_vec[i]);
+            }
+            for (size_t i = seq_vec.size(); i-- != 0; ) {
+                out.write(seq_vec[i].data(), static_cast<std::streamsize>(seq_vec[i].size()));
+            }
+            out.put('$');
+            doc_len += dna + 1;
+        }
+        seq_lengths.push_back(doc_len);
+        seq_vec.clear();
+    }
+    out.put('\0');
+    out.flush();
+    if (!out) {
+        FATAL_ERROR(("failed while writing " + grl_path).c_str());
+    }
+    out.close();
+    this->write_lengths_file();
+    this->set_total_length();
+    return 0;
 }
 
 int RefBuilder::build_input_file(size_t w, size_t p, bool probing, bool keep_seqs, bool write_pfp_files) {
