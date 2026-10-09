@@ -17,12 +17,6 @@ target_compile_definitions(mumemto_exec PRIVATE "MUMEMTO_GRLBWT_BIN=\"$<TARGET_F
 add_dependencies(mumemto_exec grlbwt-cli)
 set_arch_specific_flags(mumemto_exec)
 
-add_executable(test_mem_chunks test_mem_chunks.cpp ref_builder.cpp)
-target_link_libraries(test_mem_chunks common pfp gsacak64 sdsl z OpenMP::OpenMP_CXX)
-target_include_directories(test_mem_chunks PUBLIC "../include/" "${SAIL_INCLUDE}")
-target_compile_options(test_mem_chunks PUBLIC "-std=c++17" "-DM64" "-w")
-set_arch_specific_flags(test_mem_chunks)
-
 # Add compute_lengths executable
 add_executable(compute_lengths compute_lengths.cpp)
 target_link_libraries(compute_lengths z)
