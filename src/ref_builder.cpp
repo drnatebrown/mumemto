@@ -213,18 +213,21 @@ void RefBuilder::write_lengths_file() {
 }
 
 static unsigned char ascii_upper_tab[256];
-static bool ascii_upper_ready = false;
+
+static void init_ascii_upper() {
+    static bool ready = false;
+    if (ready)
+        return;
+    for (int i = 0; i < 256; ++i) {
+        ascii_upper_tab[i] = static_cast<unsigned char>(i);
+    }
+    for (int c = 'a'; c <= 'z'; ++c) {
+        ascii_upper_tab[c] = static_cast<unsigned char>(c - 'a' + 'A');
+    }
+    ready = true;
+}
 
 static unsigned char ascii_upper(unsigned char c) {
-    if (!ascii_upper_ready) {
-        for (int i = 0; i < 256; ++i) {
-            ascii_upper_tab[i] = static_cast<unsigned char>(i);
-        }
-        for (int c = 'a'; c <= 'z'; ++c) {
-            ascii_upper_tab[c] = static_cast<unsigned char>(c - 'a' + 'A');
-        }
-        ascii_upper_ready = true;
-    }
     return ascii_upper_tab[c];
 }
 
@@ -234,6 +237,7 @@ int RefBuilder::build_sail_grl_text(const std::string& grl_path) {
     if (from_parse) {
         FATAL_ERROR("SAIL text streaming requires FASTA inputs, not a lengths-only build");
     }
+    init_ascii_upper();
     std::vector<char> io_buf(1 << 20);
     std::ofstream out(grl_path, std::ios::binary | std::ios::trunc);
     if (!out) {

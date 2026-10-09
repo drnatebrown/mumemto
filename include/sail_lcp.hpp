@@ -135,10 +135,7 @@ public:
                 printProgress(static_cast<double>(j) / static_cast<double>(text_size));
             }
             const size_t sa = static_cast<size_t>(it.sa());
-            // DA replaces doc_ends_rank on the SAIL path only (including -R).
-            // PFP, gsacak, and --arrays-in still use the bitvector; DA cannot
-            // replace those. Lengths still build da_offsets. The EOF symbol
-            // (sa == total_length) is outside every document.
+            // The EOF symbol (sa == total_length) is outside every document.
             const size_t doc = (sa < doc_span)
                                    ? static_cast<size_t>(it.da())
                                    : ref_build->num_docs;
