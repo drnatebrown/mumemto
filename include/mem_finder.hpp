@@ -36,13 +36,6 @@
 
 class mem_finder{
 public:
-    struct binary_record {
-        size_t close_j = 0;
-        uint32_t length = 0;
-        std::vector<int64_t> starts;
-        std::vector<char> strand;
-    };
-
     // Open LCP-interval stack and the SA/BWT/DA rows it still needs.
     struct frontier {
         std::vector<std::pair<std::pair<size_t, size_t>, size_t>> mems;
@@ -114,8 +107,8 @@ public:
         // Set parameters and limits
         // this->max_freq = num_docs + max_freq;
         this->no_max_freq = max_freq == 0;
-        // Part workers write a private file (or buffer binary records) so threads
-        // do not share the final output stream.
+        // Part workers write a private spill file so threads do not share the
+        // final output stream.
         suppress_side_files = part_id >= 0;
         const std::string base = suppress_side_files
                                      ? filename + ".part" + std::to_string(part_id)
@@ -128,6 +121,9 @@ public:
                 bums_lengths.open(filename + std::string(".bumbl.lengths"), std::ios::binary);
                 bums_starts.open(filename + std::string(".bumbl.starts"), std::ios::binary);
                 bums_strands.open(filename + std::string(".bumbl.strands"), std::ios::binary);
+            } else {
+                binmum_path = base + ".binmum";
+                binmum_out.open(binmum_path, std::ios::binary | std::ios::trunc);
             }
         } else {
             text_path = base + ".mums";
@@ -208,20 +204,8 @@ public:
         }
     }
 
-    std::vector<binary_record> release_binary() { return std::move(bin_recs); }
-
     const std::string& part_text_path() const { return text_path; }
-
-    // Write merged binary records into this finder's bumbl intermediates.
-    // close() then packs them. Records must already be in output order.
-    void adopt_binary_records(const std::vector<binary_record>& recs) {
-        for (const auto& rec : recs) {
-            bums_lengths.write(reinterpret_cast<const char*>(&rec.length), sizeof(rec.length));
-            bums_starts.write(reinterpret_cast<const char*>(rec.starts.data()),
-                              sizeof(int64_t) * rec.starts.size());
-            bums_strands_vec.push_back(rec.strand);
-        }
-    }
+    const std::string& part_binary_path() const { return binmum_path; }
 
     // interiors are concatenated in order (increasing close index). If tagged,
     // each line is "close_j\\tbody". An optional stitch file is merged in,
@@ -289,11 +273,83 @@ public:
         }
     }
 
+    // Interiors are concatenated in order. An optional stitch file is merged
+    // by close_j, with interior records winning ties (inner LCP intervals pop
+    // before the outer straddlers). close() then packs the .bumbl.
+    void write_merged_binary(const std::vector<std::string>& interior_paths, const std::string& stitch_path) {
+        struct spilled {
+            uint64_t close_j = 0;
+            uint32_t length = 0;
+            std::vector<int64_t> starts;
+            std::vector<char> strand;
+            bool ok = false;
+        };
+        auto pull = [&](std::istream& in, spilled& rec) {
+            uint64_t close_j = 0;
+            uint32_t length = 0;
+            if (!in.read(reinterpret_cast<char*>(&close_j), sizeof(close_j)) ||
+                !in.read(reinterpret_cast<char*>(&length), sizeof(length))) {
+                rec.ok = false;
+                return;
+            }
+            rec.close_j = close_j;
+            rec.length = length;
+            rec.starts.resize(num_docs);
+            rec.strand.resize(num_docs);
+            in.read(reinterpret_cast<char*>(rec.starts.data()), sizeof(int64_t) * num_docs);
+            in.read(rec.strand.data(), static_cast<std::streamsize>(num_docs));
+            rec.ok = static_cast<bool>(in);
+        };
+        auto emit = [&](const spilled& rec) {
+            bums_lengths.write(reinterpret_cast<const char*>(&rec.length), sizeof(rec.length));
+            bums_starts.write(reinterpret_cast<const char*>(rec.starts.data()),
+                              sizeof(int64_t) * rec.starts.size());
+            append_strand_bits(rec.strand.data(), rec.strand.size());
+        };
+
+        std::vector<std::ifstream> interiors;
+        interiors.reserve(interior_paths.size());
+        for (const auto& path : interior_paths)
+            interiors.emplace_back(path, std::ios::binary);
+        std::ifstream stitch;
+        if (!stitch_path.empty())
+            stitch.open(stitch_path, std::ios::binary);
+
+        size_t ip = 0;
+        spilled irec;
+        spilled srec;
+        auto pull_interior = [&]() {
+            irec.ok = false;
+            while (ip < interiors.size()) {
+                pull(interiors[ip], irec);
+                if (irec.ok)
+                    return;
+                ++ip;
+            }
+        };
+        pull_interior();
+        if (stitch.is_open())
+            pull(stitch, srec);
+
+        while (irec.ok || srec.ok) {
+            const bool take_interior = irec.ok && (!srec.ok || irec.close_j <= srec.close_j);
+            if (take_interior) {
+                emit(irec);
+                pull_interior();
+            } else {
+                emit(srec);
+                pull(stitch, srec);
+            }
+        }
+    }
+
     virtual void close()
     {
         if (suppress_side_files) {
             if (mem_file.is_open())
                 mem_file.close();
+            if (binmum_out.is_open())
+                binmum_out.close();
             return;
         }
         if (binary)
@@ -369,7 +425,7 @@ protected:
     std::ofstream bums_lengths;
     std::ofstream bums_starts;
     std::ofstream bums_strands;
-    std::vector<std::vector<char>> bums_strands_vec;
+    std::ofstream binmum_out;
     
     // Helper functions and variables to compute MEMs
     
@@ -592,18 +648,7 @@ private:
         if (binary) {
             uint32_t length_uint32 = static_cast<uint32_t>(length);
             std::vector<int64_t> converted(offsets.begin(), offsets.end());
-            if (suppress_side_files) {
-                binary_record rec;
-                rec.close_j = emit_close_j;
-                rec.length = length_uint32;
-                rec.starts = std::move(converted);
-                rec.strand = strand;
-                bin_recs.push_back(std::move(rec));
-            } else {
-                bums_lengths.write(reinterpret_cast<const char*>(&length_uint32), sizeof(length_uint32));
-                bums_starts.write(reinterpret_cast<const char*>(converted.data()), sizeof(int64_t) * offsets.size());
-                bums_strands_vec.push_back(strand);
-            }
+            emit_binary_match(length_uint32, converted, strand);
         }
         else {
             for (int i = 0; i < num_docs - 1; i++)
@@ -660,22 +705,44 @@ private:
         return flags;
     }
 
-    inline void write_bums() {
-        size_t num_mems = bums_strands_vec.size();
-        size_t num_seqs = bums_strands_vec[0].size();
-        // Prepare packed data buffer
-        std::vector<uint8_t> buffer((num_mems * num_seqs + 7) / 8, 0);
-        // Pack bits into bytes
-        for (size_t i = 0; i < num_mems; ++i) {
-            for (size_t j = 0; j < num_seqs; ++j) {
-                size_t bitIndex = i * num_seqs + j;
-                if (bums_strands_vec[i][j] == '+') {
-                    buffer[bitIndex / 8] |= (1 << (7 - (bitIndex % 8))); // Set bit for '+'
-                }
+    inline void append_strand_bits(const char* strand, size_t n) {
+        for (size_t j = 0; j < n; ++j) {
+            if (strand[j] == '+')
+                strand_byte |= static_cast<uint8_t>(1u << (7 - strand_bit));
+            if (++strand_bit == 8) {
+                bums_strands.put(static_cast<char>(strand_byte));
+                strand_byte = 0;
+                strand_bit = 0;
             }
         }
-        // Write packed data to file
-        bums_strands.write(reinterpret_cast<const char*>(buffer.data()), buffer.size());
+        ++num_mems_written;
+    }
+
+    inline void emit_binary_match(uint32_t length_uint32, const std::vector<int64_t>& converted,
+                                  const std::vector<char>& strand) {
+        if (suppress_side_files) {
+            const uint64_t close_j = emit_close_j;
+            binmum_out.write(reinterpret_cast<const char*>(&close_j), sizeof(close_j));
+            binmum_out.write(reinterpret_cast<const char*>(&length_uint32), sizeof(length_uint32));
+            binmum_out.write(reinterpret_cast<const char*>(converted.data()),
+                             sizeof(int64_t) * converted.size());
+            binmum_out.write(strand.data(), static_cast<std::streamsize>(strand.size()));
+        } else {
+            bums_lengths.write(reinterpret_cast<const char*>(&length_uint32), sizeof(length_uint32));
+            bums_starts.write(reinterpret_cast<const char*>(converted.data()),
+                              sizeof(int64_t) * converted.size());
+            append_strand_bits(strand.data(), strand.size());
+        }
+    }
+
+    inline void write_bums() {
+        if (strand_bit != 0) {
+            bums_strands.put(static_cast<char>(strand_byte));
+            strand_byte = 0;
+            strand_bit = 0;
+        }
+        const size_t num_mems = num_mems_written;
+        const size_t num_seqs = num_docs;
         bums_strands.close();
         bums_lengths.close();
         bums_starts.close();
@@ -739,7 +806,10 @@ private:
     size_t keep_hi = std::numeric_limits<size_t>::max();
     size_t emit_close_j = 0;
     bool saw_real_bwt_change = false;
-    std::vector<binary_record> bin_recs;
+    std::string binmum_path;
+    size_t num_mems_written = 0;
+    uint8_t strand_byte = 0;
+    uint8_t strand_bit = 0;
 };
 
 #endif /* end of include guard: _MEM_HH */

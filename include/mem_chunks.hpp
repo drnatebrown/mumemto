@@ -61,41 +61,9 @@ void for_each_stream_index(Parts& parts, size_t first, size_t last_inclusive, Fn
     }
 }
 
-inline std::vector<mem_finder::binary_record> merge_binary_records(
-    std::vector<std::vector<mem_finder::binary_record>>& interiors,
-    const std::vector<mem_finder::binary_record>& stitch) {
-    std::vector<mem_finder::binary_record> out;
-    size_t part = 0;
-    size_t ii = 0;
-    size_t si = 0;
-    auto interior = [&]() -> mem_finder::binary_record* {
-        while (part < interiors.size()) {
-            if (ii < interiors[part].size())
-                return &interiors[part][ii];
-            ++part;
-            ii = 0;
-        }
-        return nullptr;
-    };
-    while (true) {
-        auto* left = interior();
-        const bool right = si < stitch.size();
-        if (left == nullptr && !right)
-            break;
-        if (left != nullptr && (!right || left->close_j <= stitch[si].close_j)) {
-            out.push_back(std::move(*left));
-            ++ii;
-        } else {
-            out.push_back(stitch[si]);
-            ++si;
-        }
-    }
-    return out;
-}
-
 // parts cover [0, domain) in order. overlap selects the width-W path;
 // otherwise the unbounded stitch path is used. make_part(id) builds a private
-// finder (id >= 0) that does not write side files.
+// finder (id >= 0) that spills to a private part file.
 template <class Parts, class Decode, class Factory>
 size_t run_chunked_match_finding(mem_finder& owner, Parts& parts, size_t domain,
                                  bool overlap, size_t width, Decode decode, Factory make_part) {
@@ -211,41 +179,35 @@ size_t run_chunked_match_finding(mem_finder& owner, Parts& parts, size_t domain,
     }
 
     std::vector<std::string> interior_paths;
-    std::vector<std::vector<mem_finder::binary_record>> interior_bins;
-    if (owner.binary)
-        interior_bins.resize(k);
     for (size_t i = 0; i < k; ++i) {
         if (!workers[i])
             continue;
         owner.absorb_merge_state(*workers[i]);
         workers[i]->close();
         if (owner.binary) {
-            interior_bins[i] = workers[i]->release_binary();
+            if (!workers[i]->part_binary_path().empty())
+                interior_paths.push_back(workers[i]->part_binary_path());
         } else if (!workers[i]->part_text_path().empty()) {
             interior_paths.push_back(workers[i]->part_text_path());
         }
     }
 
     std::string stitch_path;
-    std::vector<mem_finder::binary_record> stitch_bins;
     if (stitch) {
         owner.absorb_merge_state(*stitch);
         stitch->close();
-        if (owner.binary)
-            stitch_bins = stitch->release_binary();
-        else
-            stitch_path = stitch->part_text_path();
+        stitch_path = owner.binary ? stitch->part_binary_path() : stitch->part_text_path();
     }
 
     if (owner.binary) {
-        owner.adopt_binary_records(merge_binary_records(interior_bins, stitch_bins));
+        owner.write_merged_binary(interior_paths, stitch_path);
     } else {
         owner.write_merged_text(interior_paths, stitch_path, !overlap && k > 1);
-        for (const auto& path : interior_paths)
-            std::filesystem::remove(path);
-        if (!stitch_path.empty())
-            std::filesystem::remove(stitch_path);
     }
+    for (const auto& path : interior_paths)
+        std::filesystem::remove(path);
+    if (!stitch_path.empty())
+        std::filesystem::remove(stitch_path);
     return total;
 }
 

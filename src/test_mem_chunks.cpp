@@ -178,6 +178,8 @@ void check_array_fixtures(const std::string& dir) {
     check_case(dir, rows, ref, uneven, 4, 2, 3, 0, false, false, "mem_stitch_uneven");
     check_case(dir, rows, ref, quarters, 4, 2, 3, 0, false, false, "mem_stitch_quarters");
     check_case(dir, rows, ref, uneven, 4, 2, 1, 3, true, false, "mum_binary");
+    check_case(dir, rows, ref, uneven, 4, 2, 1, 0, true, false, "mum_binary_stitch_uneven");
+    check_case(dir, rows, ref, quarters, 4, 2, 1, 0, true, false, "mum_binary_stitch_quarters");
     check_case(dir, rows, ref, quarters, 4, 2, 1, 3, false, true, "mum_merge");
 }
 
@@ -228,6 +230,57 @@ void check_sail(const std::string& dir) {
         std::exit(1);
     }
     expect_eq("sail mum", slurp(dir + "/mum1" + ext_mum), slurp(dir + "/mum4" + ext_mum));
+
+    {
+        // Production RLBWTs cover total_length + the trailing EOF. The smoke
+        // heads above sum to total_length, so append that EOF run here.
+        auto ext_heads = heads;
+        auto ext_lens = lengths;
+        ext_heads.push_back(0);
+        ext_lens.push_back(1);
+        {
+            std::ofstream heads_out(sail_prefix + ".bwt.heads", std::ios::binary);
+            std::ofstream lens_out(sail_prefix + ".bwt.len", std::ios::binary);
+            for (size_t i = 0; i < ext_heads.size(); ++i) {
+                heads_out.put(static_cast<char>(ext_heads[i]));
+                unsigned char buf[5] = {};
+                const auto len = static_cast<uint64_t>(ext_lens[i]);
+                for (size_t b = 0; b < 5; ++b)
+                    buf[b] = static_cast<unsigned char>((len >> (8 * b)) & 0xffu);
+                lens_out.write(reinterpret_cast<char*>(buf), 5);
+            }
+        }
+        const std::string ext_sail = dir + "/ext";
+        std::filesystem::copy_file(sail_prefix + ".lengths", ext_sail + ".lengths",
+                                   std::filesystem::copy_options::overwrite_existing);
+        {
+            auto stream = sail::make_stream(ext_heads, ext_lens)
+                              .with_bwt()
+                              .with_lcp()
+                              .with_da(offsets)
+                              .threads(2)
+                              .max_chunks(8)
+                              .fast()
+                              .forward();
+            std::ofstream out(ext_sail + ".sail", std::ios::binary);
+            stream.serialize(out);
+        }
+        auto run_matches = [&](const std::string& prefix, const std::string& index, bool from_runs_flag) {
+            sail_lcp sail(prefix, &ref, index, 2, false, from_runs_flag);
+            sail.construct();
+            mem_finder finder(prefix, ref, 1, 1, 2, 8, false, false, false);
+            const size_t count = sail.process(finder);
+            finder.close();
+            return count;
+        };
+        const size_t via_sail = run_matches(dir + "/extsail", ext_sail, false);
+        const size_t via_runs = run_matches(dir + "/fromrl", sail_prefix, true);
+        if (via_sail == 0 || via_sail != via_runs) {
+            std::cerr << "from-rlbwt counts " << via_runs << " vs sail " << via_sail << "\n";
+            std::exit(1);
+        }
+        expect_eq("from-rlbwt mum", slurp(dir + "/extsail" + ext_mum), slurp(dir + "/fromrl" + ext_mum));
+    }
 
     const size_t mem1 = run(dir + "/mem1", 1, 4, 0);
     const size_t mem4 = run(dir + "/mem4", 4, 4, 0);
